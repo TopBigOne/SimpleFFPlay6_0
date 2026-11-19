@@ -109,6 +109,10 @@ set(SOURCE_FILES
         src/filter/av_filters.h
         src/filter/av_filters.c
 
+        # 低延迟直播：延迟估计（借鉴 WebRTC）
+        src/live/live_latency.h
+        src/live/live_latency.c
+
         # 界面：SDL 句柄、事件循环
         src/ui/sdl_context.h
         src/ui/sdl_context.c

@@ -17,6 +17,10 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double 
            av_get_picture_type_char(src_frame->pict_type), pts);
 #endif
 
+    // 低延迟模式：在可能阻塞的 peek_writable 之前记录"解码完成时刻"，更新抖动估计和目标延迟
+    if (low_latency)
+        live_latency_on_frame(&is->live, pts, av_gettime_relative() / 1000000.0);
+
     if (!(vp = frame_queue_peek_writable(&is->pictq)))
         return -1;
 

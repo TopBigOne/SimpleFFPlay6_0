@@ -12,6 +12,7 @@
 #include "pipeline/frame_queue.h"
 #include "pipeline/packet_queue.h"
 #include "sync/clock.h"
+#include "live/live_latency.h"
 
 /**
  * @brief 一组音频参数：采样率、声道布局、采样格式，以及推导出的帧大小和每秒字节数
@@ -126,4 +127,6 @@ typedef struct VideoState {
     int last_video_stream, last_audio_stream, last_subtitle_stream;
 
     SDL_cond *continue_read_thread;
+
+    LiveLatency live;   ///< -lowlatency 时的延迟估计（新增，原版 ffplay 没有）
 } VideoState;

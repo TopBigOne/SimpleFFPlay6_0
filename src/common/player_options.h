@@ -13,6 +13,7 @@
 extern unsigned sws_flags;
 
 /* options specified by the user */
+//声明（带 extern）
 extern const AVInputFormat *file_iformat;      ///< -f 强制输入格式
 extern const char *input_filename;             ///< 输入文件 / URL
 extern const char *window_title;               ///< -window_title
@@ -39,6 +40,10 @@ extern int64_t duration;                       ///< -t 播放时长（微秒）
 extern int fast;                               ///< -fast
 extern int genpts;                             ///< -genpts
 extern int lowres;                             ///< -lowres
+extern int hwaccel;                            ///< -hwaccel 视频优先硬解（macOS 用 VideoToolbox），默认开，-nohwaccel 关闭
+extern int low_latency;                        ///< -lowlatency 安防低延迟直播模式（见 live/live_latency.h）
+extern int latency_min_ms;                     ///< -latency_min 低延迟模式目标延迟下限（毫秒）
+extern int latency_max_ms;                     ///< -latency_max 低延迟模式目标延迟上限（毫秒），积压超过 2 倍时跳到关键帧
 extern int decoder_reorder_pts;                ///< -drp
 extern int autoexit;                           ///< -autoexit 播完退出
 extern int exit_on_keydown;                    ///< -exitonkeydown

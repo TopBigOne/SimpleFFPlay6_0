@@ -71,6 +71,34 @@ retry:
             if (is->paused)
                 goto display;
 
+            /*
+             * 低延迟模式：按截止时间显示（借鉴 WebRTC frame_decode_timing）
+             *   render_time = pts + base + target，没到就等；
+             *   到了以后，如果后面那帧也已经到了显示时刻，说明当前帧已经过时，直接丢掉看更新的；
+             *   否则显示当前帧。延迟估计还没就绪（render_time 为 NAN）时退回原版逻辑。
+             */
+            if (low_latency && !is->step) {
+                double rt = live_latency_render_time(&is->live, vp->pts);
+                if (!isnan(rt)) {
+                    time = av_gettime_relative() / 1000000.0;
+                    if (time < rt) {
+                        *remaining_time = FFMIN(rt - time, *remaining_time);
+                        goto display;
+                    }
+                    if (frame_queue_nb_remaining(&is->pictq) > 1) {
+                        Frame *nextvp = frame_queue_peek_next(&is->pictq);
+                        double next_rt = live_latency_render_time(&is->live, nextvp->pts);
+                        if (nextvp->serial == vp->serial && !isnan(next_rt) && time >= next_rt) {
+                            is->frame_drops_late++;
+                            frame_queue_next(&is->pictq);
+                            goto retry;
+                        }
+                    }
+                    is->frame_timer = time;
+                    goto show;
+                }
+            }
+
             /* compute nominal last_duration */
             last_duration = vp_duration(is, lastvp, vp);
             delay = compute_target_delay(last_duration, is);
@@ -85,6 +113,7 @@ retry:
             if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
                 is->frame_timer = time;
 
+show:
             SDL_LockMutex(is->pictq.mutex);
             if (!isnan(vp->pts))
                 update_video_pts(is, vp->pts, vp->pos, vp->serial);
@@ -184,6 +213,12 @@ display:
                       sqsize,
                       is->video_st ? is->viddec.avctx->pts_correction_num_faulty_dts : 0,
                       is->video_st ? is->viddec.avctx->pts_correction_num_faulty_pts : 0);
+            // 低延迟模式：lag = 当前画面比"最顺利情况"晚多少，tgt = 目标延迟，jump = 跳关键帧次数
+            if (low_latency && is->video_st && is->vidclk.serial == is->videoq.serial) {
+                double lag = live_latency_lag(&is->live, is->vidclk.pts, cur_time / 1000000.0);
+                av_bprintf(&buf, "lag=%4.0fms tgt=%3.0fms jump=%d   \r",
+                           isnan(lag) ? 0 : lag * 1000, live_latency_target(&is->live) * 1000, is->live.flushes);
+            }
 
             if (show_status == 1 && AV_LOG_INFO > av_log_get_level())
                 fprintf(stderr, "%s", buf.str);

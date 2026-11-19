@@ -10,6 +10,46 @@
 
 int64_t audio_callback_time;
 
+/** 低延迟模式下，音频帧结束时刻比主时钟（视频）早这么多秒就丢弃 */
+#define LIVE_AUDIO_DROP_THRESHOLD 0.08
+
+/**
+ * @brief 低延迟模式：音频帧已经落后于视频主时钟，直接丢掉，让声音追上画面
+ * @note 原版用 synchronize_audio 最多 ±10% 增减采样慢慢追，卡顿后积压的几百毫秒要追很久
+ */
+static int audio_frame_too_late(VideoState *is, Frame *af)
+{
+    double master, end;
+
+    if (!low_latency || isnan(af->pts) || get_master_sync_type(is) == AV_SYNC_AUDIO_MASTER)
+        return 0;
+    master = get_master_clock(is);
+    if (isnan(master))
+        return 0;
+    end = af->pts + (double)af->frame->nb_samples / af->frame->sample_rate;
+    return end < master - LIVE_AUDIO_DROP_THRESHOLD;
+}
+
+/**
+ * @brief 低延迟模式：音频帧还没到显示时刻（pts + base + target，与视频同一个截止时间），先不播
+ * @note 视频要等到截止时间才显示，音频如果解出就播会比画面超前约 target。
+ *       借鉴 WebRTC"谁快就给谁加延迟"：音频也按同一截止时间播放，没到就输出一段静音、帧留在队列里。
+ *       这次写进 SDL 缓冲的数据要过约 2 个硬件缓冲才真正响，所以截止时间减去这段延迟再比较。
+ */
+static int audio_frame_too_early(VideoState *is, Frame *af)
+{
+    double rt, now, hw_delay;
+
+    if (!low_latency || !is->video_st || isnan(af->pts))
+        return 0;
+    rt = live_latency_render_time(&is->live, af->pts);
+    if (isnan(rt))
+        return 0;
+    now      = audio_callback_time / 1000000.0;
+    hw_delay = 2.0 * is->audio_hw_buf_size / is->audio_tgt.bytes_per_sec;
+    return rt > now + hw_delay;
+}
+
 /**
  * Decode one audio frame and return its uncompressed size.
  *
@@ -37,8 +77,11 @@ int audio_decode_frame(VideoState *is)
 #endif
         if (!(af = frame_queue_peek_readable(&is->sampq)))
             return -1;
+        // 还没到播放时刻：不取走这帧，返回 -1 让回调输出一小段静音
+        if (af->serial == is->audioq.serial && audio_frame_too_early(is, af))
+            return -1;
         frame_queue_next(&is->sampq);
-    } while (af->serial != is->audioq.serial);
+    } while (af->serial != is->audioq.serial || audio_frame_too_late(is, af));
 
     data_size = av_samples_get_buffer_size(NULL, af->frame->ch_layout.nb_channels,
                                            af->frame->nb_samples,
@@ -199,7 +242,8 @@ int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int wanted_
         next_sample_rate_idx--;
     wanted_spec.format = AUDIO_S16SYS;
     wanted_spec.silence = 0;
-    wanted_spec.samples = FFMAX(SDL_AUDIO_MIN_BUFFER_SIZE, 2 << av_log2(wanted_spec.freq / SDL_AUDIO_MAX_CALLBACKS_PER_SEC));
+    // 低延迟模式：每秒回调 120 次，44.1k/48k 下缓冲 512 采样 ≈ 11ms（原版约 2048 采样 ≈ 46ms）
+    wanted_spec.samples = FFMAX(SDL_AUDIO_MIN_BUFFER_SIZE, 2 << av_log2(wanted_spec.freq / (low_latency ? 120 : SDL_AUDIO_MAX_CALLBACKS_PER_SEC)));
     wanted_spec.callback = sdl_audio_callback;
     wanted_spec.userdata = opaque;
     while (!(audio_dev = SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &spec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_CHANNELS_CHANGE))) {

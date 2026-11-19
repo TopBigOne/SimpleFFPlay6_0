@@ -30,6 +30,26 @@ int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                 switch (d->avctx->codec_type) {
                     case AVMEDIA_TYPE_VIDEO:
                         ret = avcodec_receive_frame(d->avctx, frame);
+                        if (ret >= 0 && frame->hw_frames_ctx) {
+                            // 硬解帧在 GPU 上（如 VIDEOTOOLBOX），下载成内存帧（通常 NV12）再交给滤镜和渲染
+                            AVFrame *sw = av_frame_alloc();
+                            if (!sw) {
+                                av_frame_unref(frame);
+                                return AVERROR(ENOMEM);
+                            }
+                            if ((ret = av_hwframe_transfer_data(sw, frame, 0)) >= 0)
+                                ret = av_frame_copy_props(sw, frame);
+                            if (ret < 0) {
+                                av_log(d->avctx, AV_LOG_ERROR, "Failed to transfer hardware frame: %s\n", av_err2str(ret));
+                                av_frame_free(&sw);
+                                av_frame_unref(frame);
+                                ret = AVERROR(EAGAIN); // 丢掉这一帧，继续解下一帧
+                                break;
+                            }
+                            av_frame_unref(frame);
+                            av_frame_move_ref(frame, sw);
+                            av_frame_free(&sw);
+                        }
                         if (ret >= 0) {
                             if (decoder_reorder_pts == -1) {
                                 frame->pts = frame->best_effort_timestamp;

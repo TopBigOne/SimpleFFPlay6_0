@@ -10,6 +10,60 @@
 #include "filter/av_filters.h"
 #include "subtitle/subtitle_thread.h"
 #include "ui/sdl_context.h"
+#include "libavutil/hwcontext.h"
+#include "libavutil/pixdesc.h"
+
+#ifdef __APPLE__
+/**
+ * @brief get_format 回调：解码器给出的候选里有 VIDEOTOOLBOX 就选它，否则退回第一个软件格式
+ * @note 硬解初始化失败（如不支持的 profile）时，libavcodec 会去掉该格式再调一次本回调，从而自动退回软解
+ */
+static enum AVPixelFormat get_hw_format(AVCodecContext *avctx, const enum AVPixelFormat *fmts)
+{
+    const enum AVPixelFormat *p;
+
+    for (p = fmts; *p != AV_PIX_FMT_NONE; p++)
+        if (*p == AV_PIX_FMT_VIDEOTOOLBOX)
+            return *p;
+
+    for (p = fmts; *p != AV_PIX_FMT_NONE; p++) {
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
+        if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+            av_log(avctx, AV_LOG_WARNING, "VideoToolbox unavailable for this stream, falling back to software decoding\n");
+            return *p;
+        }
+    }
+    return AV_PIX_FMT_NONE;
+}
+
+/**
+ * @brief 给视频解码上下文挂上 VideoToolbox 设备；失败只打日志，继续走软解
+ */
+static void setup_videotoolbox(AVCodecContext *avctx, const AVCodec *codec)
+{
+    AVBufferRef *device_ref = NULL;
+    int i, ret;
+
+    for (i = 0;; i++) {
+        const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
+        if (!cfg) {
+            av_log(avctx, AV_LOG_INFO, "Decoder %s has no VideoToolbox support, using software decoding\n", codec->name);
+            return;
+        }
+        if (cfg->device_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX &&
+            (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+            break;
+    }
+
+    if ((ret = av_hwdevice_ctx_create(&device_ref, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0)) < 0) {
+        av_log(avctx, AV_LOG_WARNING, "Failed to create VideoToolbox device: %s, using software decoding\n", av_err2str(ret));
+        return;
+    }
+    avctx->hw_device_ctx = device_ref;
+    avctx->get_format = get_hw_format;
+    av_log(avctx, AV_LOG_INFO, "Using VideoToolbox hardware decoding for %s\n", codec->name);
+}
+#endif
 #include "video/video_decoder_thread.h"
 
 void stream_component_close(VideoState *is, int stream_index)
@@ -94,6 +148,7 @@ void stream_close(VideoState *is)
     frame_queue_destory(&is->sampq);
     frame_queue_destory(&is->subpq);
     SDL_DestroyCond(is->continue_read_thread);
+    live_latency_uninit(&is->live);
     sws_freeContext(is->img_convert_ctx);
     sws_freeContext(is->sub_convert_ctx);
     av_free(is->filename);
@@ -160,6 +215,15 @@ int stream_component_open(VideoState *is, int stream_index)
 
     if (fast)
         avctx->flags2 |= AV_CODEC_FLAG2_FAST;
+    // 低延迟模式：解码器不为 B 帧重排攒帧，解出就输出（摄像头需关闭 B 帧）
+    if (low_latency)
+        avctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+#ifdef __APPLE__
+    // lowres 是软解专属的缩小解码，开了就不走硬解
+    if (hwaccel && !stream_lowres && avctx->codec_type == AVMEDIA_TYPE_VIDEO)
+        setup_videotoolbox(avctx, codec);
+#endif
 
     opts = filter_codec_opts(codec_opts, avctx->codec_id, ic, ic->streams[stream_index], codec);
     if (!av_dict_get(opts, "threads", NULL, 0))
@@ -300,6 +364,9 @@ VideoState *stream_open(const char *filename,
         goto fail;
     }
 
+    if (live_latency_init(&is->live, latency_min_ms, latency_max_ms) < 0)
+        goto fail;
+
     init_clock(&is->vidclk, &is->videoq.serial);
     init_clock(&is->audclk, &is->audioq.serial);
     init_clock(&is->extclk, &is->extclk.serial);
@@ -313,6 +380,9 @@ VideoState *stream_open(const char *filename,
     is->audio_volume = startup_volume;
     is->muted = 0;
     is->av_sync_type = av_sync_type;
+    // 低延迟模式以视频为主时钟：安防场景"看到此刻"优先，音频落后就丢帧跟上视频
+    if (low_latency)
+        is->av_sync_type = AV_SYNC_VIDEO_MASTER;
     is->read_tid     = SDL_CreateThread(read_thread, "read_thread", is);
     if (!is->read_tid) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());

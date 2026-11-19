@@ -22,6 +22,48 @@ static int stream_has_enough_packets(AVStream *st, int stream_id, PacketQueue *q
            queue->nb_packets > MIN_FRAMES && (!queue->duration || av_q2d(st->time_base) * queue->duration > 1.0);
 }
 
+/**
+ * @brief 低延迟模式：每个包入队前调用
+ *  1. 参考流（有视频用视频，否则用音频）的包更新延迟基准 base（见 live/live_latency.h）
+ *  2. 视频关键帧到达时，如果它比当前显示的画面超前了 2 × latency_max 以上，说明积压过多
+ *     （解码跟不上或卡顿后数据涌入）：清空三个包队列，从这个关键帧重新开始。
+ *     packet_queue_flush 会让 serial + 1，解码器、帧队列里的旧数据自动作废（ffplay 原有机制）。
+ */
+static void live_on_packet(VideoState *is, AVPacket *pkt)
+{
+    int ref_stream = is->video_stream >= 0 ? is->video_stream : is->audio_stream;
+    AVStream *st;
+    int64_t ts;
+    double pts, now, shown_pts;
+
+    if (pkt->stream_index != ref_stream)
+        return;
+    st  = is->ic->streams[pkt->stream_index];
+    ts  = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+    pts = ts == AV_NOPTS_VALUE ? NAN : ts * av_q2d(st->time_base);
+    now = av_gettime_relative() / 1000000.0;
+
+    live_latency_on_packet(&is->live, pts, now);
+
+    if (pkt->stream_index != is->video_stream || !(pkt->flags & AV_PKT_FLAG_KEY) || isnan(pts))
+        return;
+    // 当前显示画面的 pts；serial 不一致说明刚 flush 过，还没有新画面显示，不判断
+    if (is->vidclk.serial != is->videoq.serial)
+        return;
+    shown_pts = is->vidclk.pts;
+    if (isnan(shown_pts) || pts - shown_pts <= 2.0 * latency_max_ms / 1000.0)
+        return;
+
+    is->live.flushes++;
+    av_log(NULL, AV_LOG_WARNING, "live: backlog %.0fms > %dms, jumping to keyframe at %.3f\n",
+           (pts - shown_pts) * 1000, 2 * latency_max_ms, pts);
+    if (is->audio_stream >= 0)
+        packet_queue_flush(&is->audioq);
+    if (is->subtitle_stream >= 0)
+        packet_queue_flush(&is->subtitleq);
+    packet_queue_flush(&is->videoq);
+}
+
 static int is_realtime(AVFormatContext *s)
 {
     if(   !strcmp(s->iformat->name, "rtp")
@@ -80,6 +122,9 @@ int read_thread(void *arg)
         av_dict_set(&format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
+    // 低延迟模式：探测阶段少缓存包，加快起播（用户自己给了 -fflags 就不覆盖）
+    if (low_latency)
+        av_dict_set(&format_opts, "fflags", "nobuffer", AV_DICT_DONT_OVERWRITE);
     err = avformat_open_input(&ic, is->filename, is->iformat, &format_opts);
     if (err < 0) {
         print_error(is->filename, err);
@@ -220,6 +265,14 @@ int read_thread(void *arg)
 
     if (infinite_buffer < 0 && is->realtime)
         infinite_buffer = 1;
+    // 低延迟模式：读线程有多少读多少，不让数据堆在 socket 里；延迟由显示端按截止时间丢帧来控制
+    if (low_latency) {
+        infinite_buffer = 1;
+        // 延迟估计依赖"包按实时节奏到达"，本地文件 / 点播会被一口气读完，估计会失真
+        if (ic->pb && (ic->pb->seekable & AVIO_SEEKABLE_NORMAL))
+            av_log(NULL, AV_LOG_WARNING, "-lowlatency is meant for live streams; '%s' looks seekable (file/VOD), playback timing may be wrong\n",
+                   is->filename);
+    }
 
     for (;;) {
         if (is->abort_request)
@@ -335,6 +388,8 @@ int read_thread(void *arg)
                 av_q2d(ic->streams[pkt->stream_index]->time_base) -
                 (double)(start_time != AV_NOPTS_VALUE ? start_time : 0) / 1000000
                 <= ((double)duration / 1000000);
+        if (low_latency && pkt_in_play_range)
+            live_on_packet(is, pkt);
         if (pkt->stream_index == is->audio_stream && pkt_in_play_range) {
             packet_queue_put(&is->audioq, pkt);
         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
