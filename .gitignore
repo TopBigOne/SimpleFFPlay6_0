@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# CMake build output (CLion: cmake-build-*, command line: build/)
+cmake-build-*/
+build/
+
+# Claude Code local settings
+.claude/settings.local.json
