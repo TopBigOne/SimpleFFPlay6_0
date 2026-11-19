@@ -40,6 +40,13 @@ void live_latency_uninit(LiveLatency *l)
     l->mutex = NULL;
 }
 
+void live_latency_reset(LiveLatency *l)
+{
+    SDL_LockMutex(l->mutex);
+    reset_locked(l);
+    SDL_UnlockMutex(l->mutex);
+}
+
 void live_latency_on_packet(LiveLatency *l, double pts, double now)
 {
     double o;

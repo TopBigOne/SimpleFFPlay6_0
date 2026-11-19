@@ -129,4 +129,5 @@ typedef struct VideoState {
     SDL_cond *continue_read_thread;
 
     LiveLatency live;   ///< -lowlatency 时的延迟估计（新增，原版 ffplay 没有）
+    int64_t io_deadline; ///< 直播重连：网络读写的截止时刻（av_gettime_relative 微秒），超过就中断；0 = 不限（新增）
 } VideoState;

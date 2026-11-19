@@ -44,6 +44,8 @@ extern int hwaccel;                            ///< -hwaccel 视频优先硬解�
 extern int low_latency;                        ///< -lowlatency 安防低延迟直播模式（见 live/live_latency.h）
 extern int latency_min_ms;                     ///< -latency_min 低延迟模式目标延迟下限（毫秒）
 extern int latency_max_ms;                     ///< -latency_max 低延迟模式目标延迟上限（毫秒），积压超过 2 倍时跳到关键帧
+extern int live_reconnect;                     ///< -live_reconnect 直播断线自动重连：1 = 开，0 = 关，-1 = 跟随 -lowlatency
+extern int reconnect_max;                      ///< -reconnect_max 连续多少次没有进展才放弃（默认 6，同 ExoPlayer）；0 = 无限重试
 extern int decoder_reorder_pts;                ///< -drp
 extern int autoexit;                           ///< -autoexit 播完退出
 extern int exit_on_keydown;                    ///< -exitonkeydown

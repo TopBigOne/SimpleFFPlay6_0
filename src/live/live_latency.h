@@ -49,6 +49,9 @@ int live_latency_init(LiveLatency *l, int min_ms, int max_ms);
 /** @brief 释放锁 */
 void live_latency_uninit(LiveLatency *l);
 
+/** @brief 清空估计（断线重连后时间戳可能不连续，必须重新建立基准） */
+void live_latency_reset(LiveLatency *l);
+
 /**
  * @brief 读线程：参考流（有视频用视频，否则用音频）每收到一个包调用一次，更新 base
  * @param[in] pts  包的 pts（秒）；NAN 时忽略

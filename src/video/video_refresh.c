@@ -211,8 +211,9 @@ display:
                       aqsize / 1024,
                       vqsize / 1024,
                       sqsize,
-                      is->video_st ? is->viddec.avctx->pts_correction_num_faulty_dts : 0,
-                      is->video_st ? is->viddec.avctx->pts_correction_num_faulty_pts : 0);
+                      // 直播重连时读线程会关闭并重建解码器，avctx 可能短暂为 NULL
+                      is->video_st && is->viddec.avctx ? is->viddec.avctx->pts_correction_num_faulty_dts : 0,
+                      is->video_st && is->viddec.avctx ? is->viddec.avctx->pts_correction_num_faulty_pts : 0);
             // 低延迟模式：lag = 当前画面比"最顺利情况"晚多少，tgt = 目标延迟，jump = 跳关键帧次数
             if (low_latency && is->video_st && is->vidclk.serial == is->videoq.serial) {
                 double lag = live_latency_lag(&is->live, is->vidclk.pts, cur_time / 1000000.0);
