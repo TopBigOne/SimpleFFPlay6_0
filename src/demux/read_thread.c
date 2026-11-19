@@ -125,24 +125,19 @@ static int wait_or_abort(VideoState *is, SDL_mutex *wait_mutex, int ms)
 }
 
 /**
- * @brief 重新建立连接并替换掉旧的
+ * @brief 建立一个新连接：打开输入 + 探测流信息（首次连接重试和断线重连共用）
  *
- * 顺序：先打开新连接、探测流信息；成功后才关闭旧的解码线程（它们引用旧 ic 的 AVStream），
- * 换上新 ic，再按原来打开了哪几种流重新打开。失败时旧的一切保持不变，画面停在最后一帧。
- * 重新打开的解码器、包队列 serial 都是新的，旧数据由 ffplay 的 serial 机制自动作废。
+ * 用 opts_template 的副本打开（avformat_open_input 会改写传入的字典），整个过程受 LIVE_OPEN_TIMEOUT_US 限制。
  *
- * @param[in,out] pic          read_thread 的局部 ic，成功后指向新连接
- * @param[in]     reopen_opts  第一次打开前保存的格式选项（如 rtsp_transport）
- * @return 0 = 成功；<0 = 打开失败的错误码
+ * @param[out] out            成功时得到新的 AVFormatContext
+ * @param[in]  opts_template  第一次打开前保存的格式选项（如 rtsp_transport）
+ * @return 0 = 成功；<0 = 错误码（AVERROR_OPTION_NOT_FOUND 表示有不认识的选项）
  */
-static int reopen_input(VideoState *is, AVFormatContext **pic, AVDictionary *reopen_opts)
+static int open_input(VideoState *is, AVFormatContext **out, AVDictionary *opts_template)
 {
     AVFormatContext *nic;
     AVDictionary *opts = NULL;
-    int had_audio = is->audio_stream >= 0;
-    int had_video = is->video_stream >= 0;
-    int had_sub   = is->subtitle_stream >= 0;
-    int vi = -1, ai = -1, si = -1;
+    const AVDictionaryEntry *t;
     int i, err;
 
     nic = avformat_alloc_context();
@@ -151,10 +146,23 @@ static int reopen_input(VideoState *is, AVFormatContext **pic, AVDictionary *reo
     nic->interrupt_callback.callback = decode_interrupt_cb;
     nic->interrupt_callback.opaque = is;
 
-    av_dict_copy(&opts, reopen_opts, 0);
+    av_dict_copy(&opts, opts_template, 0);
     is->io_deadline = av_gettime_relative() + LIVE_OPEN_TIMEOUT_US;
     err = avformat_open_input(&nic, is->filename, is->iformat, &opts);  // 失败时会释放 nic 并置 NULL
+    if (err >= 0) {
+        // 没被消费的选项：scan_all_pmts 是 read_thread 自动加的，非 mpegts 不认识，忽略；其他就是写错了
+        av_dict_set(&opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
+        if ((t = av_dict_get(opts, "", NULL, AV_DICT_IGNORE_SUFFIX))) {
+            av_log(NULL, AV_LOG_ERROR, "Option %s not found.\n", t->key);
+            err = AVERROR_OPTION_NOT_FOUND;
+        }
+    }
     av_dict_free(&opts);
+    if (err >= 0) {
+        if (genpts)
+            nic->flags |= AVFMT_FLAG_GENPTS;
+        av_format_inject_global_side_data(nic);
+    }
     if (err >= 0 && find_stream_info) {
         AVDictionary **sopts = setup_find_stream_info_opts(nic, codec_opts);
         int orig_nb_streams = nic->nb_streams;
@@ -169,6 +177,32 @@ static int reopen_input(VideoState *is, AVFormatContext **pic, AVDictionary *reo
         avformat_close_input(&nic);
         return err;
     }
+    *out = nic;
+    return 0;
+}
+
+/**
+ * @brief 重新建立连接并替换掉旧的
+ *
+ * 顺序：先打开新连接、探测流信息；成功后才关闭旧的解码线程（它们引用旧 ic 的 AVStream），
+ * 换上新 ic，再按原来打开了哪几种流重新打开。失败时旧的一切保持不变，画面停在最后一帧。
+ * 重新打开的解码器、包队列 serial 都是新的，旧数据由 ffplay 的 serial 机制自动作废。
+ *
+ * @param[in,out] pic          read_thread 的局部 ic，成功后指向新连接
+ * @param[in]     reopen_opts  第一次打开前保存的格式选项（如 rtsp_transport）
+ * @return 0 = 成功；<0 = 打开失败的错误码
+ */
+static int reopen_input(VideoState *is, AVFormatContext **pic, AVDictionary *reopen_opts)
+{
+    AVFormatContext *nic = NULL;
+    int had_audio = is->audio_stream >= 0;
+    int had_video = is->video_stream >= 0;
+    int had_sub   = is->subtitle_stream >= 0;
+    int vi = -1, ai = -1, si = -1;
+    int i, err;
+
+    if ((err = open_input(is, &nic, reopen_opts)) < 0)
+        return err;
 
     // 新连接就绪：关掉旧的解码线程，再换 ic
     if (had_audio)
@@ -181,9 +215,6 @@ static int reopen_input(VideoState *is, AVFormatContext **pic, AVDictionary *reo
     is->ic = nic;
     avformat_close_input(pic);
     *pic = nic;
-    if (genpts)
-        nic->flags |= AVFMT_FLAG_GENPTS;
-    av_format_inject_global_side_data(nic);
     is->realtime = is_realtime(nic);
     is->max_frame_duration = (nic->iformat->flags & AVFMT_TS_DISCONT) ? 10.0 : 3600.0;
     is->eof = 0;
@@ -211,20 +242,24 @@ static int reopen_input(VideoState *is, AVFormatContext **pic, AVDictionary *reo
 }
 
 /**
- * @brief 断线后按 ExoPlayer 规则重连，直到成功、放弃或退出
+ * @brief 按 ExoPlayer 规则重试连接，直到成功、放弃或退出（首次连接失败和播放中断线共用）
  *
  * 第 n 次连续失败后等 min((n−1) × 1s, 5s)：0、1、2、3、4、5、5… 秒。
  * retry_count 只在读到包（有进展）时由调用方清零，所以"连上了但一个包都没读到又断"也会继续累加。
  *
- * @param[in]     reason       导致断线的错误码（用于日志）
+ * @param[in,out] pic          首次连接时传入 NULL、成功后得到新连接；断线重连时是旧连接、成功后替换为新连接
+ * @param[in]     initial      1 = 首次连接（还没有解码线程，只需打开）；0 = 播放中断线（要替换旧连接）
+ * @param[in]     reason       导致失败的错误码（用于日志）
  * @param[in,out] retry_count  连续无进展的失败次数
- * @return 0 = 已重连；AVERROR_EXIT = 收到退出请求；其他 <0 = 放弃
+ * @return 0 = 已连上；AVERROR_EXIT = 收到退出请求；其他 <0 = 放弃
  */
 static int handle_disconnect(VideoState *is, AVFormatContext **pic, AVDictionary *reopen_opts,
-                             SDL_mutex *wait_mutex, int reason, int *retry_count)
+                             SDL_mutex *wait_mutex, int initial, int reason, int *retry_count)
 {
     int err = reason;
     AVFormatContext *old = *pic;
+    const char *first_msg = initial ? "cannot connect" : "connection lost";
+    int first = 1;
 
     /*
      * 旧连接已经断了、不会再读：先释放它占用的网络资源（avio），结构体留到新连接就绪时再整体关闭，
@@ -232,7 +267,7 @@ static int handle_disconnect(VideoState *is, AVFormatContext **pic, AVDictionary
      * 不先释放旧 socket 的话新连接会报 "Address already in use"。
      * AVFMT_NOFILE 的格式（如 rtsp）socket 归 demuxer 自己管，客户端端口是临时的，不会冲突。
      */
-    if (old->pb && !(old->iformat->flags & AVFMT_NOFILE) && !(old->flags & AVFMT_FLAG_CUSTOM_IO))
+    if (old && old->pb && !(old->iformat->flags & AVFMT_NOFILE) && !(old->flags & AVFMT_FLAG_CUSTOM_IO))
         avio_closep(&old->pb);
 
     for (;;) {
@@ -249,18 +284,19 @@ static int handle_disconnect(VideoState *is, AVFormatContext **pic, AVDictionary
         if (reconnect_max > 0)
             snprintf(max_str, sizeof(max_str), "%d", reconnect_max);
         av_log(NULL, AV_LOG_WARNING, "live: %s (%s), reconnecting in %.0fs (attempt %d/%s)\n",
-               err == reason ? "connection lost" : "reconnect failed",
+               first ? first_msg : "reconnect failed",
                av_err2str(err), delay_ms / 1000.0, *retry_count, max_str);
+        first = 0;
         if (wait_or_abort(is, wait_mutex, delay_ms))
             return AVERROR_EXIT;
 
-        err = reopen_input(is, pic, reopen_opts);
+        err = initial ? open_input(is, pic, reopen_opts) : reopen_input(is, pic, reopen_opts);
         if (is->abort_request)
             return AVERROR_EXIT;
         if (err == AVERROR_EXIT)
             err = AVERROR(ETIMEDOUT);   // 被 io_deadline 中断 = 打开超时
         if (err >= 0) {
-            av_log(NULL, AV_LOG_WARNING, "live: reconnected\n");
+            av_log(NULL, AV_LOG_WARNING, "live: %s\n", initial ? "connected" : "reconnected");
             return 0;
         }
         if (is_fatal_open_error(err)) {
@@ -323,45 +359,57 @@ int read_thread(void *arg)
         av_dict_copy(&reopen_opts, format_opts, 0);
         is->io_deadline = av_gettime_relative() + LIVE_OPEN_TIMEOUT_US;  // 首次连接也加超时，防止卡死
     }
-    err = avformat_open_input(&ic, is->filename, is->iformat, &format_opts);
+    err = avformat_open_input(&ic, is->filename, is->iformat, &format_opts);  // 失败时会释放 ic 并置 NULL
+    if (err >= 0) {
+        if (scan_all_pmts_set)
+            av_dict_set(&format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
+
+        if ((t = av_dict_get(format_opts, "", NULL, AV_DICT_IGNORE_SUFFIX))) {
+            av_log(NULL, AV_LOG_ERROR, "Option %s not found.\n", t->key);
+            ret = AVERROR_OPTION_NOT_FOUND;
+            goto fail;
+        }
+
+        if (genpts)
+            ic->flags |= AVFMT_FLAG_GENPTS;
+
+        av_format_inject_global_side_data(ic);
+
+        if (find_stream_info) {
+            AVDictionary **opts = setup_find_stream_info_opts(ic, codec_opts);
+            int orig_nb_streams = ic->nb_streams;
+
+            err = avformat_find_stream_info(ic, opts);
+
+            for (i = 0; i < orig_nb_streams; i++)
+                av_dict_free(&opts[i]);
+            av_freep(&opts);
+
+            if (err < 0) {
+                av_log(NULL, AV_LOG_WARNING,
+                       "%s: could not find codec parameters\n", is->filename);
+                avformat_close_input(&ic);   // 当作连接失败：直播时进入下面的重试
+            }
+        }
+    }
+    is->io_deadline = 0;
+
+    // 首次连接失败（摄像头还没上线、网络暂时不通）：直播重连模式下按同样的规则重试
+    if (err < 0 && reconnect_enabled() && !is->abort_request && !is_fatal_open_error(err)) {
+        if (err == AVERROR_EXIT)
+            err = AVERROR(ETIMEDOUT);   // 被 io_deadline 中断 = 连接超时
+        err = handle_disconnect(is, &ic, reopen_opts, wait_mutex, 1, err, &retry_count);
+        if (err == AVERROR_EXIT) {      // 等待期间用户关闭了窗口
+            ret = 0;
+            goto fail;
+        }
+    }
     if (err < 0) {
         print_error(is->filename, err);
         ret = -1;
         goto fail;
     }
-    if (scan_all_pmts_set)
-        av_dict_set(&format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
-
-    if ((t = av_dict_get(format_opts, "", NULL, AV_DICT_IGNORE_SUFFIX))) {
-        av_log(NULL, AV_LOG_ERROR, "Option %s not found.\n", t->key);
-        ret = AVERROR_OPTION_NOT_FOUND;
-        goto fail;
-    }
     is->ic = ic;
-
-    if (genpts)
-        ic->flags |= AVFMT_FLAG_GENPTS;
-
-    av_format_inject_global_side_data(ic);
-
-    if (find_stream_info) {
-        AVDictionary **opts = setup_find_stream_info_opts(ic, codec_opts);
-        int orig_nb_streams = ic->nb_streams;
-
-        err = avformat_find_stream_info(ic, opts);
-
-        for (i = 0; i < orig_nb_streams; i++)
-            av_dict_free(&opts[i]);
-        av_freep(&opts);
-
-        if (err < 0) {
-            av_log(NULL, AV_LOG_WARNING,
-                   "%s: could not find codec parameters\n", is->filename);
-            ret = -1;
-            goto fail;
-        }
-    }
-    is->io_deadline = 0;
 
     if (ic->pb)
         ic->pb->eof_reached = 0; // FIXME hack, ffplay maybe should not use avio_feof() to test for the end
@@ -564,7 +612,7 @@ int read_thread(void *arg)
             // 直播没有"播完"：EOF（服务器断开）、IO 错误、读超时都当断线处理
             if (ret == AVERROR_EXIT)
                 ret = AVERROR(ETIMEDOUT);   // 被 io_deadline 中断 = 4 秒没收到数据
-            ret = handle_disconnect(is, &ic, reopen_opts, wait_mutex, ret, &retry_count);
+            ret = handle_disconnect(is, &ic, reopen_opts, wait_mutex, 0, ret, &retry_count);
             if (ret == AVERROR_EXIT)
                 break;
             if (ret < 0)
