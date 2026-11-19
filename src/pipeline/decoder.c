@@ -50,6 +50,12 @@ int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                             av_frame_move_ref(frame, sw);
                             av_frame_free(&sw);
                         }
+                        // libavcodec 6.0 不会把包上的 AV_PKT_FLAG_CORRUPT 传到帧上，这里自己补：
+                        // 用 FF_DECODE_ERROR_INVALID_BITSTREAM 标记，交给 video_thread 决定是否冻结等关键帧
+                        if (ret >= 0 && d->corrupt_pending) {
+                            frame->decode_error_flags |= FF_DECODE_ERROR_INVALID_BITSTREAM;
+                            d->corrupt_pending = 0;
+                        }
                         if (ret >= 0) {
                             if (decoder_reorder_pts == -1) {
                                 frame->pts = frame->best_effort_timestamp;
@@ -94,6 +100,7 @@ int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                     return -1;
                 if (old_serial != d->pkt_serial) {
                     avcodec_flush_buffers(d->avctx);
+                    d->corrupt_pending = 0;
                     d->finished = 0;
                     d->next_pts = d->start_pts;
                     d->next_pts_tb = d->start_pts_tb;
@@ -117,10 +124,15 @@ int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
             }
             av_packet_unref(d->pkt);
         } else {
-            if (avcodec_send_packet(d->avctx, d->pkt) == AVERROR(EAGAIN)) {
+            int send_ret = avcodec_send_packet(d->avctx, d->pkt);
+            if (send_ret == AVERROR(EAGAIN)) {
                 av_log(d->avctx, AV_LOG_ERROR, "Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
                 d->packet_pending = 1;
             } else {
+                // 视频：包在传输中损坏（如 MPEG-TS 连续计数器断了）或解码器拒收（如硬解失败），记下来
+                if (d->avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
+                    ((d->pkt->flags & AV_PKT_FLAG_CORRUPT) || (send_ret < 0 && send_ret != AVERROR_EOF)))
+                    d->corrupt_pending = 1;
                 av_packet_unref(d->pkt);
             }
         }

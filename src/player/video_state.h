@@ -130,4 +130,12 @@ typedef struct VideoState {
 
     LiveLatency live;   ///< -lowlatency 时的延迟估计（新增，原版 ffplay 没有）
     int64_t io_deadline; ///< 直播重连：网络读写的截止时刻（av_gettime_relative 微秒），超过就中断；0 = 不限（新增）
+
+    /* -freeze_on_corrupt：丢包后冻结在最后一个好帧，等干净的关键帧再恢复（新增，借鉴 WebRTC） */
+    int     vid_wait_key;        ///< 1 = 正在等关键帧，解出的帧都丢弃
+    int     vid_wait_bad;        ///< 1 = 这次等待是因为出现了损坏帧（而不只是 serial 变化）
+    int     vid_wait_serial;     ///< 上次检查时的包 serial；变化（seek / 跳关键帧 / 重连）后也要先等关键帧
+    int64_t vid_wait_since;      ///< 开始等关键帧的时刻（微秒）
+    int     vid_wait_dropped;    ///< 本次冻结丢掉的帧数
+    int     vid_freezes;         ///< 因损坏冻结的累计次数（-stats 显示）
 } VideoState;

@@ -22,6 +22,7 @@ typedef struct Decoder {
     AVRational start_pts_tb;
     int64_t next_pts;           ///< 预测的下一帧 pts
     AVRational next_pts_tb;
+    int corrupt_pending;        ///< 视频：送进解码器的包被标记损坏 / 解码报错，下一个输出帧要标记为错误（新增）
     SDL_Thread *decoder_tid;
 } Decoder;
 

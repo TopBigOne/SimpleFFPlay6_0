@@ -141,6 +141,28 @@ if 积压 > 2 × latency_max（默认 600ms）:
 
 用户自己给了 `-fflags`、`-analyzeduration` 时以用户的为准。
 
+## 7.1 丢包不花屏（-freeze_on_corrupt）
+
+借鉴 WebRTC 的规则：**参考链不完整的帧永远不显示**。丢包后，后面的 P 帧都参考了坏数据，即使它们自己解码"成功"也会花屏，所以从损坏那一帧起全部丢弃，画面停在最后一个好帧，直到下一个干净的关键帧。
+
+| 损坏信号 | 来源 | 位置 |
+|---|---|---|
+| 包被标记 `AV_PKT_FLAG_CORRUPT` | MPEG-TS 连续计数器断了 / PES 长度不对 | [decoder.c](../src/pipeline/decoder.c)：libavcodec 6.0 不会把它传到帧上，这里自己补成 `FF_DECODE_ERROR_INVALID_BITSTREAM` |
+| `avcodec_send_packet` 报错 | 硬解失败、码流无效 | 同上 |
+| 帧的 `decode_error_flags` / `AV_FRAME_FLAG_CORRUPT` | H.264 软解发现条带错误、做了错误掩盖 | libavcodec |
+
+判断逻辑在 [video_decoder_thread.c](../src/video/video_decoder_thread.c) 的 `frame_integrity_ok()`：
+
+- 正常出画面时遇到坏帧：开始一次"冻结"，`-stats` 的 `frz` 加 1，后续帧全部丢弃；
+- 等到 `key_frame` 的干净帧（IDR 或带恢复点 SEI）：恢复显示，打印冻结时长和丢帧数；
+- 包 serial 变化（seek、跳关键帧、重连）后也先等关键帧，但不算冻结；
+- 冻结期间不触发"积压跳关键帧"——那时的落后是冻结造成的，不是解码积压；
+- 10 秒还没有关键帧（摄像头用逐行刷新、不发关键帧）就放弃等待，避免永久冻结。
+
+局限：
+- **RTSP 走 UDP 丢包时 FFmpeg 不打损坏标记**，只能靠解码器自己发现错误；硬解时解码器不报错，可能漏检。RTSP 请用 `-rtsp_transport tcp`。
+- 没有重传时，随机丢包会让画面频繁冻结（1% 丢包约冻结一半时间，见 [tests/live/README.md](../tests/live/README.md)）。
+
 ## 8. 参数与观测
 
 ```bash
@@ -152,11 +174,13 @@ if 积压 > 2 × latency_max（默认 600ms）:
 | `-lowlatency` | 关 | 打开本算法 |
 | `-latency_min` | 30 | 目标延迟下限（ms） |
 | `-latency_max` | 300 | 目标延迟上限（ms）；积压超过它的 2 倍就跳关键帧 |
+| `-freeze_on_corrupt` | 随 `-lowlatency` | 丢包 / 解码出错时冻结在最后一个好帧，等关键帧恢复 |
+| `-live_reconnect` / `-reconnect_max` | 随 `-lowlatency` / 6 | 断线重连（0 = 无限重试） |
 
 `-stats` 状态行末尾会多出：
 
 ```
-lag=  42ms tgt= 30ms jump=1
+lag=  42ms tgt= 30ms jump=1 frz=0
 ```
 
 | 字段 | 含义 |
@@ -164,6 +188,7 @@ lag=  42ms tgt= 30ms jump=1
 | `lag` | 当前画面比"最顺利情况"晚了多少 = 现在 − 画面 pts − base |
 | `tgt` | 当前目标延迟 |
 | `jump` | 累计跳关键帧次数 |
+| `frz` | 累计因损坏冻结的次数 |
 | `fd`（原有字段） | 累计丢帧数 |
 
 注意 `lag` **不是端到端延迟**：它不含摄像头编码和网络最低传输时间（这部分在 base 里，播放器测不到）。端到端延迟要用真实摄像头对着秒表拍屏幕来测。

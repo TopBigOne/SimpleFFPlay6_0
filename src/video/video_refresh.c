@@ -217,8 +217,9 @@ display:
             // 低延迟模式：lag = 当前画面比"最顺利情况"晚多少，tgt = 目标延迟，jump = 跳关键帧次数
             if (low_latency && is->video_st && is->vidclk.serial == is->videoq.serial) {
                 double lag = live_latency_lag(&is->live, is->vidclk.pts, cur_time / 1000000.0);
-                av_bprintf(&buf, "lag=%4.0fms tgt=%3.0fms jump=%d   \r",
-                           isnan(lag) ? 0 : lag * 1000, live_latency_target(&is->live) * 1000, is->live.flushes);
+                av_bprintf(&buf, "lag=%4.0fms tgt=%3.0fms jump=%d frz=%d   \r",
+                           isnan(lag) ? 0 : lag * 1000, live_latency_target(&is->live) * 1000, is->live.flushes,
+                           is->vid_freezes);
             }
 
             if (show_status == 1 && AV_LOG_INFO > av_log_get_level())

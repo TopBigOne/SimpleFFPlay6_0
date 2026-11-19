@@ -43,12 +43,81 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double 
     return 0;
 }
 
+/** 冻结等关键帧最多等这么久（微秒）：有的摄像头用逐行刷新（intra refresh）不发关键帧，不能永远冻住 */
+#define CORRUPT_FREEZE_MAX_US 10000000
+
+static int freeze_enabled(void)
+{
+    return freeze_on_corrupt > 0 || (freeze_on_corrupt < 0 && low_latency);
+}
+
+/**
+ * @brief 丢包不花屏（借鉴 WebRTC：参考链不完整的帧永远不解码 / 不显示）
+ *
+ * 一帧被标记损坏（传输层丢包、解码出错、解码器做了错误掩盖）之后，后面的 P 帧都参考了坏数据，
+ * 即使它们自己解码"成功"也可能花屏。所以从这一帧起全部丢弃，画面停在最后一个好帧，
+ * 直到一个干净的关键帧（IDR 或带恢复点 SEI）到来。包 serial 变化（seek、跳关键帧、重连）后同样先等关键帧。
+ *
+ * @return 1 = 这帧可以显示；0 = 丢弃
+ */
+static int frame_integrity_ok(VideoState *is, AVFrame *frame)
+{
+    int64_t now = av_gettime_relative();
+    int bad = frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT);
+
+    // serial 变化（seek / 跳关键帧 / 重连）：解码器已 flush，正常情况，静默等关键帧；正在进行的损坏冻结继续算同一次
+    if (is->viddec.pkt_serial != is->vid_wait_serial) {
+        is->vid_wait_serial = is->viddec.pkt_serial;
+        if (!is->vid_wait_key) {
+            is->vid_wait_key   = 1;
+            is->vid_wait_since = now;
+        }
+    }
+
+    if (bad) {
+        // 只有正常出画面时出现损坏才算一次"冻结"；起播 / 跳转后本来就在等首个关键帧，那时的坏帧静默丢弃
+        if (!is->vid_wait_key && !is->vid_wait_bad) {
+            is->vid_wait_bad   = 1;
+            is->vid_wait_since = now;
+            is->vid_freezes++;
+            av_log(NULL, AV_LOG_WARNING, "live: corrupted video frame (pts %"PRId64", errors 0x%x), holding last good frame until next keyframe\n",
+                   frame->pts, frame->decode_error_flags);
+        }
+        is->vid_wait_key = 1;
+        is->vid_wait_dropped++;
+        return 0;
+    }
+
+    if (!is->vid_wait_key)
+        return 1;
+
+    if (frame->key_frame || now - is->vid_wait_since > CORRUPT_FREEZE_MAX_US) {
+        if (!frame->key_frame)
+            av_log(NULL, AV_LOG_WARNING, "live: no keyframe within %ds, resuming display anyway\n",
+                   CORRUPT_FREEZE_MAX_US / 1000000);
+        if (is->vid_wait_bad)
+            av_log(NULL, AV_LOG_WARNING, "live: recovered after %.0fms frozen, dropped %d frames\n",
+                   (now - is->vid_wait_since) / 1000.0, is->vid_wait_dropped);
+        is->vid_wait_key     = 0;
+        is->vid_wait_bad     = 0;
+        is->vid_wait_dropped = 0;
+        return 1;
+    }
+    is->vid_wait_dropped++;
+    return 0;
+}
+
 static int get_video_frame(VideoState *is, AVFrame *frame)
 {
     int got_picture;
 
     if ((got_picture = decoder_decode_frame(&is->viddec, frame, NULL)) < 0)
         return -1;
+
+    if (got_picture && freeze_enabled() && !frame_integrity_ok(is, frame)) {
+        av_frame_unref(frame);
+        return 0;
+    }
 
     if (got_picture) {
         double dpts = NAN;

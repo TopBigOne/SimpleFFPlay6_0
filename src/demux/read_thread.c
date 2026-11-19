@@ -62,6 +62,10 @@ static void live_on_packet(VideoState *is, AVPacket *pkt)
 
     if (pkt->stream_index != is->video_stream || !(pkt->flags & AV_PKT_FLAG_KEY) || isnan(pts))
         return;
+    // 画面因损坏冻结、正在等关键帧时，"落后"是冻结造成的而不是解码积压，不触发跳转
+    // （否则会把音频队列也一起清掉；关键帧解出来后按截止时间显示，自然回到当前）
+    if (is->vid_wait_bad)
+        return;
     // 当前显示画面的 pts；serial 不一致说明刚 flush 过，还没有新画面显示，不判断
     if (is->vidclk.serial != is->videoq.serial)
         return;

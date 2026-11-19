@@ -40,6 +40,7 @@ int latency_min_ms = 30;                                 // -latency_min 目标�
 int latency_max_ms = 300;                                // -latency_max 目标延迟上限（毫秒）；积压超过它的 2 倍就跳到下一个关键帧
 int live_reconnect = -1;                                 // -live_reconnect 直播断线自动重连：1 = 开，0 = 关，-1 = 开了 -lowlatency 就开
 int reconnect_max = 6;                                   // -reconnect_max 连续多少次没有读到任何包才放弃（同 ExoPlayer）；0 = 无限重试
+int freeze_on_corrupt = -1;                              // -freeze_on_corrupt 丢包 / 解码出错后冻结在最后一个好帧，等关键帧恢复；-1 = 开了 -lowlatency 就开
 int decoder_reorder_pts = -1;                            // -drp 帧时间戳来源：1 = 用 pts，0 = 用 dts，-1 = 用 best_effort_timestamp
 int autoexit;                                            // -autoexit 播放结束后自动退出
 int exit_on_keydown;                                     // -exitonkeydown 按任意键退出
