@@ -40,7 +40,10 @@ static int audio_frame_too_early(VideoState *is, Frame *af)
 {
     double rt, now, hw_delay;
 
-    if (!low_latency || !is->video_st || isnan(af->pts))
+    // 只在"开始出声"时对齐截止时间（起播、从断音恢复、跳转后）；正在连续播放时绝不插静音，
+    // 否则目标延迟 / 基准的小幅波动会让音频被反复判成"早了"，变成一段一段的（实测每秒约 10 次断音）。
+    // 连续播放中的音画偏差交给 synchronize_audio 的 ±10% 采样补偿慢慢修正（同 NetEq：靠变速而不是插静音）。
+    if (!low_latency || !is->video_st || isnan(af->pts) || is->audio_running)
         return 0;
     rt = live_latency_render_time(&is->live, af->pts);
     if (isnan(rt))
@@ -67,7 +70,7 @@ int audio_decode_frame(VideoState *is)
     if (is->paused)
         return -1;
 
-    do {
+    for (;;) {
 #if defined(_WIN32)
         while (frame_queue_nb_remaining(&is->sampq) == 0) {
             if ((av_gettime_relative() - audio_callback_time) > 1000000LL * is->audio_hw_buf_size / is->audio_tgt.bytes_per_sec / 2)
@@ -77,11 +80,29 @@ int audio_decode_frame(VideoState *is)
 #endif
         if (!(af = frame_queue_peek_readable(&is->sampq)))
             return -1;
-        // 还没到播放时刻：不取走这帧，返回 -1 让回调输出一小段静音
-        if (af->serial == is->audioq.serial && audio_frame_too_early(is, af))
-            return -1;
+        if (af->serial == is->audioq.serial) {
+            // 和上一段接不上（跳关键帧 / 重连后 serial 变了，或时间戳跳了 20ms 以上）：当作重新开始出声
+            if (low_latency && is->audio_running &&
+                (af->serial != is->audio_clock_serial ||
+                 (!isnan(af->pts) && !isnan(is->audio_clock) && fabs(af->pts - is->audio_clock) > 0.02)))
+                is->audio_running = 0;
+            // 还没到播放时刻：不取走这帧，返回 -1 让回调输出一小段静音
+            if (audio_frame_too_early(is, af)) {
+                is->audio_waits++;
+                return -1;
+            }
+        }
         frame_queue_next(&is->sampq);
-    } while (af->serial != is->audioq.serial || audio_frame_too_late(is, af));
+        if (af->serial == is->audioq.serial && !audio_frame_too_late(is, af))
+            break;
+        // 跳过了帧（旧 serial 或落后太多）：下一段和上一段接不上
+        if (af->serial == is->audioq.serial)
+            is->audio_drops++;
+        audio_smooth_mark_discont(&is->asmooth);
+    }
+    // 时间戳和上一帧的结束时刻差 20ms 以上（丢包、重连、跳关键帧）：同样接不上
+    if (!isnan(af->pts) && !isnan(is->audio_clock) && fabs(af->pts - is->audio_clock) > 0.02)
+        audio_smooth_mark_discont(&is->asmooth);
 
     data_size = av_samples_get_buffer_size(NULL, af->frame->ch_layout.nb_channels,
                                            af->frame->nb_samples,
@@ -168,22 +189,75 @@ int audio_decode_frame(VideoState *is)
     return resampled_data_size;
 }
 
+static int smooth_enabled(void)
+{
+    return audio_smooth > 0 || (audio_smooth < 0 && low_latency);
+}
+
+/**
+ * @brief 仅供测试：环境变量 SIMPLEFFPLAY_TEST_AUDIO_DUMP=<文件> 时，把实际交给声卡的 PCM（S16 交错）原样追加写入，
+ *        测试脚本用它检测"咔哒"跳变。文件头 12 字节："SFPA" + int32 采样率 + int32 声道数（本机字节序）
+ */
+static void test_dump_audio(const Uint8 *data, int len, int freq, int channels)
+{
+    static FILE *f;
+    static int inited;
+
+    if (!inited) {
+        const char *path = getenv("SIMPLEFFPLAY_TEST_AUDIO_DUMP");
+        inited = 1;
+        f = path ? fopen(path, "wb") : NULL;
+        if (f) {
+            int32_t hdr[2] = { freq, channels };
+            fwrite("SFPA", 1, 4, f);
+            fwrite(hdr, sizeof(hdr), 1, f);
+        }
+    }
+    if (f) {
+        fwrite(data, 1, len, f);
+        fflush(f);
+    }
+}
+
 /* prepare a new audio buffer */
 void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
 {
     VideoState *is = opaque;
     int audio_size, len1;
+    Uint8 *stream_start = stream;
+    int len_total = len;
+    int channels = is->audio_tgt.ch_layout.nb_channels;
 
     audio_callback_time = av_gettime_relative();
 
     while (len > 0) {
         if (is->audio_buf_index >= is->audio_buf_size) {
+           int waits = is->audio_waits;
            audio_size = audio_decode_frame(is);
            if (audio_size < 0) {
-                /* if error, just output silence */
-               is->audio_buf = NULL;
-               is->audio_buf_size = SDL_AUDIO_MIN_BUFFER_SIZE / is->audio_tgt.frame_size * is->audio_tgt.frame_size;
+               const uint8_t *fade = NULL;
+               int fade_size = 0;
+
+               if (is->audio_waits == waits && is->audio_running)
+                   is->audio_underruns++;
+               is->audio_running = 0;
+               // 有声 → 没数据：先播 5ms 渐弱，避免波形突然掉到 0 产生咔哒声
+               if (smooth_enabled())
+                   fade_size = audio_smooth_on_silence(&is->asmooth, &fade, channels, is->audio_tgt.freq);
+               if (fade_size > 0) {
+                   is->audio_buf = (uint8_t *)fade;
+                   is->audio_buf_size = fade_size;
+               } else {
+                   /* if error, just output silence */
+                   is->audio_buf = NULL;
+                   is->audio_buf_size = SDL_AUDIO_MIN_BUFFER_SIZE / is->audio_tgt.frame_size * is->audio_tgt.frame_size;
+               }
            } else {
+               is->audio_running = 1;
+               // 从静音恢复 / 丢过帧 / 时间戳跳变：开头 5ms 和上一段做交叉淡化
+               if (smooth_enabled())
+                   is->audio_buf = (uint8_t *)audio_smooth_on_audio(&is->asmooth, is->audio_buf, audio_size,
+                                                                     channels, is->audio_tgt.freq);
                if (is->show_mode != SHOW_MODE_VIDEO)
                    update_sample_display(is, (int16_t *)is->audio_buf, audio_size);
                is->audio_buf_size = audio_size;
@@ -205,6 +279,7 @@ void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
         is->audio_buf_index += len1;
     }
     is->audio_write_buf_size = is->audio_buf_size - is->audio_buf_index;
+    test_dump_audio(stream_start, len_total, is->audio_tgt.freq, channels);
     /* Let's assume the audio driver that is used by SDL has two periods. */
     if (!isnan(is->audio_clock)) {
         set_clock_at(&is->audclk, is->audio_clock - (double)(2 * is->audio_hw_buf_size + is->audio_write_buf_size) / is->audio_tgt.bytes_per_sec, is->audio_clock_serial, audio_callback_time / 1000000.0);

@@ -6,6 +6,12 @@
 #define LIVE_JITTER_ALPHA         (1.0 / 16)
 /** 目标延迟 = 均值 + 2.33σ（约 99% 分位） */
 #define LIVE_JITTER_SIGMA         2.33
+/** 单帧偏差限制在 ±3.5σ 以内，避免一个几秒的异常值（卡顿、解码器重建）把目标延迟顶满好几秒（同 WebRTC jitter_estimator） */
+#define LIVE_OUTLIER_SIGMA        3.5
+/** 限幅用的 σ 下限，抖动很小时也允许正常波动 */
+#define LIVE_OUTLIER_MIN_SD       0.005
+/** 前这么多帧不限幅：起播时探测阶段攒下的包一次性交出，均值要能快速收敛 */
+#define LIVE_WARMUP_FRAMES        30
 /** 渲染余量，同 WebRTC 视频 render_delay 的量级 */
 #define LIVE_RENDER_MARGIN        0.005
 /** 目标延迟每秒最多下降 100ms，同 WebRTC kDelayMaxChangeMsPerS */
@@ -99,6 +105,10 @@ void live_latency_on_frame(LiveLatency *l, double pts, double now)
         l->jitter_var  = 0;
     } else {
         diff = e - l->jitter_mean;
+        if (l->nb_frames > LIVE_WARMUP_FRAMES) {
+            double lim = LIVE_OUTLIER_SIGMA * FFMAX(sqrt(l->jitter_var), LIVE_OUTLIER_MIN_SD);
+            diff = av_clipd(diff, -lim, lim);
+        }
         l->jitter_mean += LIVE_JITTER_ALPHA * diff;
         l->jitter_var   = (1 - LIVE_JITTER_ALPHA) * (l->jitter_var + LIVE_JITTER_ALPHA * diff * diff);
     }

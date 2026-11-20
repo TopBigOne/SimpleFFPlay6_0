@@ -79,6 +79,8 @@ void stream_component_close(VideoState *is, int stream_index)
     case AVMEDIA_TYPE_AUDIO:
         decoder_abort(&is->auddec, &is->sampq);
         SDL_CloseAudioDevice(audio_dev);
+        audio_smooth_reset(&is->asmooth);   // 设备关了，下一段音频从静音开始淡入
+        is->audio_running = 0;
         decoder_destroy(&is->auddec);
         swr_free(&is->swr_ctx);
         av_freep(&is->audio_buf1);
@@ -149,6 +151,7 @@ void stream_close(VideoState *is)
     frame_queue_destory(&is->subpq);
     SDL_DestroyCond(is->continue_read_thread);
     live_latency_uninit(&is->live);
+    audio_smooth_free(&is->asmooth);
     sws_freeContext(is->img_convert_ctx);
     sws_freeContext(is->sub_convert_ctx);
     av_free(is->filename);

@@ -114,6 +114,7 @@ retry:
                 is->frame_timer = time;
 
 show:
+            is->wd_last_shown = av_gettime_relative();   // 看门狗：画面还在更新
             SDL_LockMutex(is->pictq.mutex);
             if (!isnan(vp->pts))
                 update_video_pts(is, vp->pts, vp->pos, vp->serial);
@@ -217,9 +218,9 @@ display:
             // 低延迟模式：lag = 当前画面比"最顺利情况"晚多少，tgt = 目标延迟，jump = 跳关键帧次数
             if (low_latency && is->video_st && is->vidclk.serial == is->videoq.serial) {
                 double lag = live_latency_lag(&is->live, is->vidclk.pts, cur_time / 1000000.0);
-                av_bprintf(&buf, "lag=%4.0fms tgt=%3.0fms jump=%d frz=%d   \r",
+                av_bprintf(&buf, "lag=%4.0fms tgt=%3.0fms jump=%d frz=%d wd=%d   \r",
                            isnan(lag) ? 0 : lag * 1000, live_latency_target(&is->live) * 1000, is->live.flushes,
-                           is->vid_freezes);
+                           is->vid_freezes, is->wd_triggers);
             }
 
             if (show_status == 1 && AV_LOG_INFO > av_log_get_level())

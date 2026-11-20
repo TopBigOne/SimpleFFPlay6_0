@@ -36,6 +36,7 @@ EVENTS = {
     "lost":        re.compile(r"live: (connection lost|cannot connect)"),
     "connected":   re.compile(r"live: (re)?connected"),
     "give_up":     re.compile(r"giving up after"),
+    "watchdog":    re.compile(r"watchdog: .* recovery level (\d)"),
 }
 
 
@@ -89,8 +90,9 @@ class Sender:
 class Player:
     """Runs the player and timestamps every \\r- or \\n-terminated chunk it prints."""
 
-    def __init__(self, player, url, extra, log_path):
+    def __init__(self, player, url, extra, log_path, env=None):
         self.cmd = [player, "-lowlatency", "-stats", "-loglevel", "warning", "-x", "640", "-y", "360", *extra, url]
+        self.env = {**os.environ, **(env or {})}
         self.log_path = log_path
         self.lines = []          # (t, text)
         self.t0 = None
@@ -98,7 +100,7 @@ class Player:
 
     def start(self):
         self.t0 = time.time()
-        self.proc = subprocess.Popen(self.cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen(self.cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=self.env)
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
@@ -234,6 +236,22 @@ def check_reconnect(st, ev, ctx):
     return f
 
 
+def check_watchdog(st, ev, ctx):
+    """Decoder hangs at 8s (only killing the decoder thread helps): level 1 at ~11s must not be enough,
+    level 2 at ~14s must bring the picture back, and latency must recover."""
+    f = check_stall(st, ev, ctx)
+    levels = [int(g[0]) for _, g in ev["watchdog"]]
+    ctx["watchdog_levels"] = levels
+    ctx["watchdog_at"] = [round(t, 1) for t, _ in ev["watchdog"]]
+    if levels[:2] != [1, 2]:
+        f.append(f"expected watchdog levels [1, 2], got {levels}")
+    if 3 in levels:
+        f.append("escalated to reconnect; recreating the decoder should have been enough")
+    if ev["lost"]:
+        f.append("unexpected disconnect")
+    return f
+
+
 def check_give_up(st, ev, ctx):
     f = []
     ctx["exit_at"] = round(ctx["exit_time"], 2)
@@ -269,6 +287,7 @@ SCENARIOS = [
                                                                                   lambda s, e, c: check_corruption(s, e, c, 8000, 60)),
     ("stall_1500",   "udp", ["--stall", "8:1.5"],               "always",     20, check_stall),
     ("stall_6s",     "udp", ["--stall", "6:6"],                 "always",     24, check_reconnect),
+    ("decoder_hang", "udp", [],                                 "hang_decoder", 26, check_watchdog),
     ("tcp_restart",  "tcp", None,                               "restart",    22, check_reconnect),
     ("tcp_give_up",  "tcp", None,                               "die",        35, check_give_up),
     ("tcp_late",     "tcp", None,                               "late",       12, check_late_start),
@@ -292,8 +311,9 @@ def run_scenario(idx, sc, args, enc, outdir):
         sender = Sender(args.ffmpeg, enc, f"tcp://127.0.0.1:{base}?listen=1")
         url = f"tcp://127.0.0.1:{base}"
 
-    player = Player(args.player, url, args.player_extra, os.path.join(outdir, f"{name}.log"))
-    if plan in ("always", "restart", "die"):
+    env = {"SIMPLEFFPLAY_TEST_STALL_DECODER_AT": "8"} if plan == "hang_decoder" else None
+    player = Player(args.player, url, args.player_extra, os.path.join(outdir, f"{name}.log"), env)
+    if plan in ("always", "restart", "die", "hang_decoder"):
         sender.start()
         time.sleep(0.5)
     player.start()

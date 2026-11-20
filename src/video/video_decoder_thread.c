@@ -145,6 +145,30 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
     return got_picture;
 }
 
+/**
+ * @brief 仅供测试：模拟解码器卡死，用来验证看门狗
+ *
+ * 设置环境变量 SIMPLEFFPLAY_TEST_STALL_DECODER_AT=<秒> 后，进程启动这么多秒时视频解码线程停住，
+ * 直到它的包队列被 abort（即解码器被关闭重建）才退出——和真实的解码器卡死一样，清空队列救不回来。
+ * 只触发一次，重建后的解码线程正常工作。
+ */
+static void test_maybe_stall_decoder(VideoState *is)
+{
+    static int64_t stall_at = -1;
+    static int stalled;
+
+    if (stall_at < 0) {
+        const char *env = getenv("SIMPLEFFPLAY_TEST_STALL_DECODER_AT");
+        stall_at = env ? av_gettime_relative() + (int64_t)(atof(env) * 1000000) : 0;
+    }
+    if (!stall_at || stalled || av_gettime_relative() < stall_at)
+        return;
+    stalled = 1;
+    av_log(NULL, AV_LOG_WARNING, "test: simulating a stuck video decoder\n");
+    while (!is->videoq.abort_request)
+        av_usleep(10000);
+}
+
 int video_thread(void *arg)
 {
     VideoState *is = arg;
@@ -174,6 +198,7 @@ int video_thread(void *arg)
             goto the_end;
         if (!ret)
             continue;
+        test_maybe_stall_decoder(is);
 
 #if CONFIG_AVFILTER
         if (   last_w != frame->width

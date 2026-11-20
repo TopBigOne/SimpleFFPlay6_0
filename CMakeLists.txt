@@ -112,6 +112,8 @@ set(SOURCE_FILES
         # 低延迟直播：延迟估计（借鉴 WebRTC）
         src/live/live_latency.h
         src/live/live_latency.c
+        src/live/audio_smooth.h
+        src/live/audio_smooth.c
 
         # 界面：SDL 句柄、事件循环
         src/ui/sdl_context.h

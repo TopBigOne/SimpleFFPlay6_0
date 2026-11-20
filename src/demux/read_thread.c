@@ -310,6 +310,71 @@ static int handle_disconnect(VideoState *is, AVFormatContext **pic, AVDictionary
     }
 }
 
+/** 看门狗：数据在到、画面这么久没更新就判定卡死（同 WebRTC kMaxWaitForFrame = 3s） */
+#define WATCHDOG_STALL_US    3000000
+/** 看门狗：最近这么久没收到视频包，说明是网络问题（交给 4 秒读超时 + 重连处理），看门狗不管 */
+#define WATCHDOG_INPUT_US    1000000
+/** 看门狗：上次恢复后画面持续正常这么久，升级计数清零 */
+#define WATCHDOG_HEALTHY_US  10000000
+
+/**
+ * @brief 看门狗：网络正常但画面不动（解码器卡死、硬解异常、线程死锁）时逐级恢复
+ *
+ * 判定：低延迟模式、有视频、没暂停、已经出过画面、不在"损坏冻结等关键帧"中（那个有自己的 10 秒上限），
+ * 最近 1 秒内还有视频包进来，但已经 3 秒没有显示新画面。
+ * 恢复动作逐级升级，每级之间至少再等 3 秒看效果：
+ *   1. 清空三个包队列（serial + 1，解码器 flush，从下一个关键帧重来）
+ *   2. 关闭并重建视频解码器（解码线程卡住时只有这一级能救回来）
+ *   3. 断开整条连接重连（复用 handle_disconnect）
+ * 画面恢复正常 10 秒后，级别清零。
+ *
+ * @return 0 = 继续；AVERROR_EXIT = 退出；其他 <0 = 重连放弃
+ */
+static int watchdog_check(VideoState *is, AVFormatContext **pic, AVDictionary *reopen_opts,
+                          SDL_mutex *wait_mutex, int *retry_count)
+{
+    int64_t now = av_gettime_relative();
+    int vidx;
+
+    if (!low_latency || is->video_stream < 0 || is->paused || is->step ||
+        !is->wd_last_shown || is->vid_wait_bad)
+        return 0;
+    if (now - is->wd_last_vpkt > WATCHDOG_INPUT_US)
+        return 0;
+    if (now - is->wd_last_shown < WATCHDOG_STALL_US) {
+        if (is->wd_level && now - is->wd_level_time > WATCHDOG_HEALTHY_US)
+            is->wd_level = 0;
+        return 0;
+    }
+    if (is->wd_level && now - is->wd_level_time < WATCHDOG_STALL_US)
+        return 0;     // 上一级动作的效果还没到时间看
+
+    is->wd_level = FFMIN(is->wd_level + 1, 3);
+    is->wd_level_time = now;
+    is->wd_triggers++;
+    av_log(NULL, AV_LOG_WARNING, "live: watchdog: no new picture for %.1fs while data keeps arriving, recovery level %d (%s)\n",
+           (now - is->wd_last_shown) / 1000000.0, is->wd_level,
+           is->wd_level == 1 ? "flush queues" : is->wd_level == 2 ? "recreate video decoder" : "reconnect");
+
+    switch (is->wd_level) {
+    case 1:
+        if (is->audio_stream >= 0)
+            packet_queue_flush(&is->audioq);
+        if (is->subtitle_stream >= 0)
+            packet_queue_flush(&is->subtitleq);
+        packet_queue_flush(&is->videoq);
+        return 0;
+    case 2:
+        vidx = is->video_stream;
+        stream_component_close(is, vidx);   // abort 包队列并等解码线程退出
+        if (stream_component_open(is, vidx) < 0)
+            av_log(NULL, AV_LOG_ERROR, "live: watchdog: failed to reopen the video decoder\n");
+        return 0;
+    default:
+        return handle_disconnect(is, pic, reopen_opts, wait_mutex, 0, AVERROR(ETIMEDOUT), retry_count);
+    }
+}
+
 /* this thread gets the stream from the disk or the network */
 int read_thread(void *arg)
 {
@@ -528,6 +593,11 @@ int read_thread(void *arg)
     for (;;) {
         if (is->abort_request)
             break;
+        ret = watchdog_check(is, &ic, reopen_opts, wait_mutex, &retry_count);
+        if (ret == AVERROR_EXIT)
+            break;
+        if (ret < 0)
+            goto fail;
         if (is->paused != is->last_paused) {
             is->last_paused = is->paused;
             if (is->paused)
@@ -661,6 +731,7 @@ int read_thread(void *arg)
             packet_queue_put(&is->audioq, pkt);
         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
                    && !(is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+            is->wd_last_vpkt = av_gettime_relative();
             packet_queue_put(&is->videoq, pkt);
         } else if (pkt->stream_index == is->subtitle_stream && pkt_in_play_range) {
             packet_queue_put(&is->subtitleq, pkt);

@@ -142,6 +142,7 @@ const OptionDef options[] = {
     { "live_reconnect", OPT_BOOL | OPT_EXPERT, { &live_reconnect }, "reconnect live streams on network errors (default: on with -lowlatency)", "" },
     { "reconnect_max", OPT_INT | HAS_ARG | OPT_EXPERT, { &reconnect_max }, "give up after this many consecutive failed reconnects without progress (0 = unlimited)", "count" },
     { "freeze_on_corrupt", OPT_BOOL | OPT_EXPERT, { &freeze_on_corrupt }, "on packet loss / decode errors, hold the last good frame until a clean keyframe (default: on with -lowlatency)", "" },
+    { "audio_smooth", OPT_BOOL | OPT_EXPERT, { &audio_smooth }, "fade out / cross-fade audio at dropouts and jumps to avoid clicks (default: on with -lowlatency)", "" },
     { "sync", HAS_ARG | OPT_EXPERT, { .func_arg = opt_sync }, "set audio-video sync. type (type=audio/video/ext)", "type" },
     { "autoexit", OPT_BOOL | OPT_EXPERT, { &autoexit }, "exit at the end", "" },
     { "exitonkeydown", OPT_BOOL | OPT_EXPERT, { &exit_on_keydown }, "exit on key down", "" },
