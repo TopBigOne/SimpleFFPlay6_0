@@ -22,6 +22,8 @@ python3 -I tests/live/run_live_tests.py --player path/to/SimpleFFPlay6_0 --ffmpe
 |---|---|
 | `run_live_tests.py` | 测试驱动：启动推流端、网络模拟器、播放器，解析日志和 `-stats`，按标准判定 |
 | `netem_relay.py` | UDP 网络模拟器：随机丢包、连续丢包、抖动、乱序、卡顿后突发 |
+| `audio_clicks.py` | 统计输出 PCM 里的咔哒和静音断口 |
+| `audio_ab.sh` | 音频 A/B 测试 |
 
 测试源：FFmpeg `lavfi` 生成 640×360 25fps H.264（无 B 帧，1 秒一个关键帧）+ 48kHz AAC，封装 MPEG-TS，`-re` 实时推送。
 
@@ -36,15 +38,22 @@ python3 -I tests/live/run_live_tests.py --player path/to/SimpleFFPlay6_0 --ffmpe
 | `reorder` | 0~20ms 抖动 + 1% 乱序 | 同上 |
 | `stall_1500` | 第 8 秒起扣住 1.5 秒后突发放出 | 最后 5 秒 lag p95 ≤ 300ms，最终 lag ≤ 150ms |
 | `stall_6s` | 第 6 秒起扣住 6 秒（超过 4 秒读超时） | 检测到断线并重连；追帧标准同上 |
+| `decoder_hang` | 第 8 秒让视频解码线程卡住（`SIMPLEFFPLAY_TEST_STALL_DECODER_AT`） | 看门狗依次触发第 1、2 级，不升级到重连；追帧标准同上 |
 | `tcp_restart` | TCP 推流端第 7 秒停止、第 11 秒恢复 | 检测到断线并重连；追帧标准同上 |
 | `tcp_give_up` | TCP 推流端第 7 秒停止、不再恢复 | 重试 6 次后自行退出，退出时刻约 22.5 秒（20~28 秒） |
 | `tcp_late` | TCP 推流端第 3 秒才上线 | 首次连接重试后连上并正常播放 |
 
 `lag` 是 `-stats` 打印的"当前画面比最顺利情况晚了多少"，不含摄像头编码和网络最低传输时间。
 
-## 当前结果（2026-11-19，macOS，h264_videotoolbox 推流）
+**所有场景的附加检查：**
+- 音频（UDP 场景）：导出输出 PCM，用 `audio_clicks.py` 统计咔哒。`clean`、`jitter_80ms` 要求 0 次，故障恢复类场景最多 1 次（已知遗留，见 [docs/live_reliability.md](../../docs/live_reliability.md) §3.5）；`clean` 的静音断口 ≤ 2。
+- 运行指标：每个场景开 `-metrics_file`（每秒一行），检查非空并核对：`tcp_restart` 重连 1 次、`blackout_300` 冻结 1 次且 0~2 秒、`decoder_hang` 看门狗 ≥ 2、`tcp_give_up` 写出汇总行、`clean` 帧率约 25。
 
-硬解、软解下 10/10 通过。值得注意的数据：
+另有 `audio_ab.sh`：单独做音频咔哒 / 断音 A/B 对比（用法见脚本开头）。
+
+## 当前结果
+
+2026-11-23：硬解 11/11 通过（含音频、指标检查）。2026-11-19：硬解、软解下当时的 10 个场景全部通过。值得注意的数据：
 
 | 场景 | 硬解 | 软解 |
 |---|---|---|

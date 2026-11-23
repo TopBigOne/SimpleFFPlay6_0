@@ -150,6 +150,7 @@ void stream_close(VideoState *is)
     frame_queue_destory(&is->sampq);
     frame_queue_destory(&is->subpq);
     SDL_DestroyCond(is->continue_read_thread);
+    live_metrics_close(is);          // 写汇总；要在 live_latency_uninit 之前（会读目标延迟）
     live_latency_uninit(&is->live);
     audio_smooth_free(&is->asmooth);
     sws_freeContext(is->img_convert_ctx);
@@ -368,6 +369,8 @@ VideoState *stream_open(const char *filename,
     }
 
     if (live_latency_init(&is->live, latency_min_ms, latency_max_ms) < 0)
+        goto fail;
+    if (live_metrics_open(&is->metrics, metrics_file, metrics_interval) < 0)
         goto fail;
 
     init_clock(&is->vidclk, &is->videoq.serial);

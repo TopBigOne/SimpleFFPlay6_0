@@ -2,7 +2,7 @@
 
 > 本文描述 SimpleFFPlay6.0 已实现的追帧算法：它怎么测延迟、怎么定目标、怎么丢帧和跳关键帧追回延迟，以及音频怎么跟上。
 > 背景与选型见 [live_reference_ijkplayer_webrtc.md](live_reference_ijkplayer_webrtc.md)；ffplay 原有机制见 [live_streaming_tuning.md](live_streaming_tuning.md)。
-> 断线重连是另一部分，见第 7 节。
+> 断线重连见第 7 节；看门狗、音频衔接、运行指标见 [live_reliability.md](live_reliability.md)。
 
 ## 1. 目标与思路
 
@@ -72,6 +72,8 @@ else:                target = max(wanted, target − 0.1·Δt)    // 变小：�
 target = clamp(target, latency_min, latency_max)              // 默认 [30ms, 300ms]
 ```
 
+前 30 帧之后，每帧的 `e − mean` 先限制在 ±3.5σ（σ 至少 5ms）再参与更新，避免一个几秒的异常值把目标顶满好几秒（同 WebRTC jitter_estimator，详见 [live_reliability.md](live_reliability.md) §2）。
+
 | 设计点 | 原因 | WebRTC 对应 |
 |---|---|---|
 | 用解码完成时刻而不是到达时刻算 `e` | 把解码耗时也算进去，不用单独估计解码 p95 | `VCMTiming`：target = jitter + decode_p95 + render_delay |
@@ -121,8 +123,9 @@ if 积压 > 2 × latency_max（默认 600ms）:
 
 | 情况 | 处理 | 位置 |
 |---|---|---|
-| 音频帧还没到截止时刻 | 不取走这帧，先输出约 11ms 静音 | `audio_frame_too_early()`，[audio_output.c:39](../src/audio/audio_output.c#L39) |
-| 音频帧结束时刻比视频时钟早 80ms 以上 | 直接丢掉 | `audio_frame_too_late()`，[audio_output.c:20](../src/audio/audio_output.c#L20) |
+| 开始出声时（起播、断音后、接不上时）音频帧还没到截止时刻 | 不取走这帧，先输出静音等待；**连续播放中不再检查** | `audio_frame_too_early()` |
+| 音频落后视频 80ms~0.5 秒（音频稳定晚到） | 不丢，接受这个滞后继续连续播放，同步目标随之放宽 | `audio_frame_too_late()` |
+| 音频落后视频 0.5 秒以上 | 丢掉（卡顿后的积压） | 同上 |
 | 其余小偏差 | ffplay 原有 `synchronize_audio` 的 ±10% 采样补偿 | [av_sync.c](../src/sync/av_sync.c) |
 
 - **为什么要"没到时刻先静音"**：视频要等到截止时刻才显示，音频如果解出就播，会比画面超前约 `target`。加上这条后实测音画差从 +50ms 降到 ±10ms 以内。原则同 WebRTC 音画同步：谁快就给谁加延迟。
@@ -175,12 +178,14 @@ if 积压 > 2 × latency_max（默认 600ms）:
 | `-latency_min` | 30 | 目标延迟下限（ms） |
 | `-latency_max` | 300 | 目标延迟上限（ms）；积压超过它的 2 倍就跳关键帧 |
 | `-freeze_on_corrupt` | 随 `-lowlatency` | 丢包 / 解码出错时冻结在最后一个好帧，等关键帧恢复 |
+| `-audio_smooth` | 随 `-lowlatency` | 音频断音 / 跳变处淡入淡出（见 live_reliability.md） |
+| `-metrics_file` / `-metrics_interval` | 不输出 / 5 秒 | 运行指标（见 live_reliability.md） |
 | `-live_reconnect` / `-reconnect_max` | 随 `-lowlatency` / 6 | 断线重连（0 = 无限重试） |
 
 `-stats` 状态行末尾会多出：
 
 ```
-lag=  42ms tgt= 30ms jump=1 frz=0
+lag=  42ms tgt= 30ms jump=1 frz=0 wd=0 au=0 aw=1 ad=0
 ```
 
 | 字段 | 含义 |
@@ -189,6 +194,8 @@ lag=  42ms tgt= 30ms jump=1 frz=0
 | `tgt` | 当前目标延迟 |
 | `jump` | 累计跳关键帧次数 |
 | `frz` | 累计因损坏冻结的次数 |
+| `wd` | 看门狗触发次数 |
+| `au` / `aw` / `ad` | 音频断音 / 等截止时间 / 落后被丢的次数 |
 | `fd`（原有字段） | 累计丢帧数 |
 
 注意 `lag` **不是端到端延迟**：它不含摄像头编码和网络最低传输时间（这部分在 base 里，播放器测不到）。端到端延迟要用真实摄像头对着秒表拍屏幕来测。

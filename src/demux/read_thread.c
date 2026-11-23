@@ -263,6 +263,7 @@ static int handle_disconnect(VideoState *is, AVFormatContext **pic, AVDictionary
     int err = reason;
     AVFormatContext *old = *pic;
     const char *first_msg = initial ? "cannot connect" : "connection lost";
+    int64_t lost_at = av_gettime_relative();
     int first = 1;
 
     /*
@@ -301,6 +302,15 @@ static int handle_disconnect(VideoState *is, AVFormatContext **pic, AVDictionary
             err = AVERROR(ETIMEDOUT);   // 被 io_deadline 中断 = 打开超时
         if (err >= 0) {
             av_log(NULL, AV_LOG_WARNING, "live: %s\n", initial ? "connected" : "reconnected");
+            // 断线期间本来就没画面：重置看门狗计时，给新连接出画面的时间，否则数据一到就会被误判成卡死
+            if (is->wd_last_shown)
+                is->wd_last_shown = av_gettime_relative();
+            is->wd_pkts_since_shown = 0;
+            is->wd_level = 0;
+            if (!initial) {
+                is->metrics.reconnects++;
+                is->metrics.disconnected_us += av_gettime_relative() - lost_at;
+            }
             return 0;
         }
         if (is_fatal_open_error(err)) {
@@ -314,6 +324,9 @@ static int handle_disconnect(VideoState *is, AVFormatContext **pic, AVDictionary
 #define WATCHDOG_STALL_US    3000000
 /** 看门狗：最近这么久没收到视频包，说明是网络问题（交给 4 秒读超时 + 重连处理），看门狗不管 */
 #define WATCHDOG_INPUT_US    1000000
+/** 看门狗：上次出画面以来至少收到这么多视频包（约 1.6 秒的 25fps 视频），才算"数据一直在到"；
+ *  网络卡住后数据刚恢复的那一刻"有包 + 很久没画面"同时成立，只看最近 1 秒有没有包会误判 */
+#define WATCHDOG_MIN_PKTS    40
 /** 看门狗：上次恢复后画面持续正常这么久，升级计数清零 */
 #define WATCHDOG_HEALTHY_US  10000000
 
@@ -339,7 +352,7 @@ static int watchdog_check(VideoState *is, AVFormatContext **pic, AVDictionary *r
     if (!low_latency || is->video_stream < 0 || is->paused || is->step ||
         !is->wd_last_shown || is->vid_wait_bad)
         return 0;
-    if (now - is->wd_last_vpkt > WATCHDOG_INPUT_US)
+    if (now - is->wd_last_vpkt > WATCHDOG_INPUT_US || is->wd_pkts_since_shown < WATCHDOG_MIN_PKTS)
         return 0;
     if (now - is->wd_last_shown < WATCHDOG_STALL_US) {
         if (is->wd_level && now - is->wd_level_time > WATCHDOG_HEALTHY_US)
@@ -348,6 +361,10 @@ static int watchdog_check(VideoState *is, AVFormatContext **pic, AVDictionary *r
     }
     if (is->wd_level && now - is->wd_level_time < WATCHDOG_STALL_US)
         return 0;     // 上一级动作的效果还没到时间看
+    // 帧队列是满的：解码器在正常产出，是显示端（主线程）没在取帧——例如 macOS 窗口被遮挡 / 最小化时
+    // 画面提交可能阻塞。这不是解码器的问题，清队列、重建解码器都没用，不动作
+    if (frame_queue_nb_remaining(&is->pictq) >= is->pictq.max_size)
+        return 0;
 
     is->wd_level = FFMIN(is->wd_level + 1, 3);
     is->wd_level_time = now;
@@ -716,6 +733,7 @@ int read_thread(void *arg)
         } else {
             is->eof = 0;
             retry_count = 0;    // 读到包 = 有进展，重连计数清零（同 ExoPlayer）
+            is->metrics.bytes_read += pkt->size;
         }
         /* check if packet is in play range specified by user, then queue, otherwise discard */
         stream_start_time = ic->streams[pkt->stream_index]->start_time;
@@ -732,6 +750,7 @@ int read_thread(void *arg)
         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
                    && !(is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
             is->wd_last_vpkt = av_gettime_relative();
+            is->wd_pkts_since_shown++;
             packet_queue_put(&is->videoq, pkt);
         } else if (pkt->stream_index == is->subtitle_stream && pkt_in_play_range) {
             packet_queue_put(&is->subtitleq, pkt);

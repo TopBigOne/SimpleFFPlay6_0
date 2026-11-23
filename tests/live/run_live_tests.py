@@ -26,6 +26,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 RELAY = os.path.join(HERE, "netem_relay.py")
+sys.path.insert(0, HERE)
+import audio_clicks  # noqa: E402  (same directory)
 
 STATS_RE = re.compile(r"lag=\s*(\d+)ms tgt=\s*(\d+)ms jump=(\d+) frz=(\d+)")
 EVENTS = {
@@ -252,6 +254,31 @@ def check_watchdog(st, ev, ctx):
     return f
 
 
+def check_metrics(name, path, ctx):
+    """-metrics_file must be written and agree with what the logs show."""
+    f = []
+    try:
+        rows = [json.loads(l) for l in open(path) if l.strip()]
+    except (OSError, ValueError) as e:
+        return [f"metrics file unreadable: {e}"]
+    if not rows:
+        return ["metrics file empty"]
+    last = rows[-1]
+    ctx["metrics"] = {k: last.get(k) for k in ("type", "fps", "lag_ms", "freezes", "frozen_ms", "reconnects", "disconnected_ms", "watchdog")}
+    if name == "tcp_restart" and last.get("reconnects") != 1:
+        f.append(f"metrics reconnects={last.get('reconnects')}, expected 1")
+    # 冻结从"解出第一个坏帧"算到下一个关键帧，断流期间本来就没画面不计入，所以时长在 0~1 个 GOP 之间
+    if name == "blackout_300" and not (last.get("freezes") == 1 and 0 < last.get("frozen_ms", 0) <= 2000):
+        f.append(f"metrics freezes={last.get('freezes')} frozen_ms={last.get('frozen_ms')}, expected 1 freeze of 0~2s")
+    if name == "decoder_hang" and last.get("watchdog", 0) < 2:
+        f.append(f"metrics watchdog={last.get('watchdog')}, expected >= 2")
+    if name == "tcp_give_up" and last.get("type") != "summary":
+        f.append("no summary line written on exit")
+    if name == "clean" and not (20 <= last.get("fps", 0) <= 30):
+        f.append(f"metrics fps={last.get('fps')}, expected ~25")
+    return f
+
+
 def check_give_up(st, ev, ctx):
     f = []
     ctx["exit_at"] = round(ctx["exit_time"], 2)
@@ -311,8 +338,16 @@ def run_scenario(idx, sc, args, enc, outdir):
         sender = Sender(args.ffmpeg, enc, f"tcp://127.0.0.1:{base}?listen=1")
         url = f"tcp://127.0.0.1:{base}"
 
-    env = {"SIMPLEFFPLAY_TEST_STALL_DECODER_AT": "8"} if plan == "hang_decoder" else None
-    player = Player(args.player, url, args.player_extra, os.path.join(outdir, f"{name}.log"), env)
+    env = {}
+    if plan == "hang_decoder":
+        env["SIMPLEFFPLAY_TEST_STALL_DECODER_AT"] = "8"
+    audio_dump = None
+    if transport == "udp":      # 检查音频：输出 PCM 里不能有咔哒声
+        audio_dump = os.path.join(outdir, f"{name}.pcm")
+        env["SIMPLEFFPLAY_TEST_AUDIO_DUMP"] = audio_dump
+    metrics_path = os.path.join(outdir, f"{name}.metrics.jsonl")
+    player = Player(args.player, url, args.player_extra + ["-metrics_file", metrics_path, "-metrics_interval", "1"],
+                    os.path.join(outdir, f"{name}.log"), env)
     if plan in ("always", "restart", "die", "hang_decoder"):
         sender.start()
         time.sleep(0.5)
@@ -345,6 +380,19 @@ def run_scenario(idx, sc, args, enc, outdir):
     if st:
         ctx["final"] = {"lag": st[-1][1], "tgt": st[-1][2], "jump": st[-1][3], "frz": st[-1][4]}
     failures = check(st, ev, ctx)
+    failures += check_metrics(name, metrics_path, ctx)
+    if audio_dump and os.path.exists(audio_dump):
+        try:
+            a = audio_clicks.analyze(audio_dump, skip=3)
+            ctx["audio"] = {"clicks": a["clicks"], "silent_gaps": a["silent_gaps"], "seconds": a["seconds"]}
+            # 干净 / 抖动场景必须 0 次；故障恢复的瞬间（解码器重置、采样补偿）偶发 1 次是已知遗留问题
+            max_clicks = 0 if name in ("clean", "jitter_80ms") else 1
+            if a["clicks"] > max_clicks:
+                failures.append(f"{a['clicks']} audio clicks at {a['click_times']} (allowed {max_clicks})")
+            if name == "clean" and a["silent_gaps"] > 2:
+                failures.append(f"{a['silent_gaps']} audio dropouts on a clean network")
+        except ValueError as e:
+            failures.append(f"audio dump unreadable: {e}")
     return failures, ctx
 
 

@@ -41,6 +41,8 @@ int latency_max_ms = 300;                                // -latency_max 目标�
 int live_reconnect = -1;                                 // -live_reconnect 直播断线自动重连：1 = 开，0 = 关，-1 = 开了 -lowlatency 就开
 int reconnect_max = 6;                                   // -reconnect_max 连续多少次没有读到任何包才放弃（同 ExoPlayer）；0 = 无限重试
 int freeze_on_corrupt = -1;                              // -freeze_on_corrupt 丢包 / 解码出错后冻结在最后一个好帧，等关键帧恢复；-1 = 开了 -lowlatency 就开
+const char *metrics_file;                                // -metrics_file 运行指标输出文件，每隔一段时间写一行 JSON，退出时写汇总；NULL = 不输出
+int metrics_interval = 5;                                // -metrics_interval 运行指标输出间隔（秒）
 int audio_smooth = -1;                                   // -audio_smooth 断音 / 丢帧 / 恢复处做 5ms 淡入淡出，消除咔哒声；-1 = 开了 -lowlatency 就开
 int decoder_reorder_pts = -1;                            // -drp 帧时间戳来源：1 = 用 pts，0 = 用 dts，-1 = 用 best_effort_timestamp
 int autoexit;                                            // -autoexit 播放结束后自动退出

@@ -14,6 +14,7 @@
 #include "sync/clock.h"
 #include "live/live_latency.h"
 #include "live/audio_smooth.h"
+#include "live/live_metrics.h"
 
 /**
  * @brief 一组音频参数：采样率、声道布局、采样格式，以及推导出的帧大小和每秒字节数
@@ -143,13 +144,17 @@ typedef struct VideoState {
     /* 看门狗：数据一直在到、画面却长时间不更新时逐级恢复（新增，借鉴 WebRTC 的等帧超时） */
     int64_t wd_last_vpkt;        ///< 读线程：最近一次视频包入队的时刻（微秒）
     int64_t wd_last_shown;       ///< 主线程：最近一次显示新画面的时刻（微秒）；0 = 还没显示过
+    int     wd_pkts_since_shown; ///< 读线程累加、主线程清零：上次出画面以来收到的视频包数
     int     wd_level;            ///< 当前升级到第几级（0 = 正常）
     int64_t wd_level_time;       ///< 上一次采取恢复动作的时刻
     int     wd_triggers;         ///< 累计触发次数（-stats 显示）
 
+    LiveMetrics metrics;         ///< -metrics_file：运行指标（新增）
     AudioSmooth asmooth;         ///< -audio_smooth：音频衔接处的淡入淡出状态（新增，只在音频回调线程用）
     int     audio_running;       ///< 1 = 音频正在连续出声（上一段不是静音）；音频回调线程读写
     int     audio_underruns;     ///< 正在出声时突然没数据、只能输出静音的次数（断音）
     int     audio_waits;         ///< 低延迟模式：音频帧还没到播放时刻、先输出静音等待的次数
     int     audio_drops;         ///< 低延迟模式：音频帧落后视频太多被丢弃的帧数
+    double  audio_lag_accept;    ///< 低延迟模式：音频稳定晚到时接受的额外滞后（秒），同步时以"晚这么多"为目标
+    int     audio_lag_warned;    ///< 已经提示过音频滞后
 } VideoState;

@@ -10,8 +10,10 @@
 
 int64_t audio_callback_time;
 
-/** 低延迟模式下，音频帧结束时刻比主时钟（视频）早这么多秒就丢弃 */
+/** 低延迟模式下，音频帧结束时刻比主时钟（视频）早这么多秒就算落后 */
 #define LIVE_AUDIO_DROP_THRESHOLD 0.08
+/** 音频稳定滞后时最多接受落后视频这么多秒，超过才丢帧 */
+#define LIVE_AUDIO_MAX_LAG        0.5
 
 /**
  * @brief 低延迟模式：音频帧已经落后于视频主时钟，直接丢掉，让声音追上画面
@@ -19,15 +21,38 @@ int64_t audio_callback_time;
  */
 static int audio_frame_too_late(VideoState *is, Frame *af)
 {
-    double master, end;
+    double master, end, behind;
 
     if (!low_latency || isnan(af->pts) || get_master_sync_type(is) == AV_SYNC_AUDIO_MASTER)
         return 0;
     master = get_master_clock(is);
     if (isnan(master))
         return 0;
-    end = af->pts + (double)af->frame->nb_samples / af->frame->sample_rate;
-    return end < master - LIVE_AUDIO_DROP_THRESHOLD;
+    end    = af->pts + (double)af->frame->nb_samples / af->frame->sample_rate;
+    behind = master - end;
+
+    if (behind < LIVE_AUDIO_DROP_THRESHOLD) {
+        // 音频基本跟上了视频：慢慢收回之前接受的滞后（每帧 1ms），源改善后音画重新对齐
+        is->audio_lag_accept = FFMAX(0, is->audio_lag_accept - 0.001);
+        return 0;
+    }
+    if (behind < LIVE_AUDIO_DROP_THRESHOLD + is->audio_lag_accept)
+        return 0;
+    if (behind < LIVE_AUDIO_MAX_LAG) {
+        /*
+         * 音频稳定地比同时刻的视频晚到（如 MPEG-TS 把多个 AAC 帧攒成一个 PES 一起发，实测晚约 200ms）：
+         * 每批都丢掉晚到的部分会让声音一段一段的。改为接受这个滞后、连续播放，
+         * 同步目标随之放宽（见 synchronize_audio）。安防场景画面实时优先，宁可音画有偏差也不要断音。
+         */
+        is->audio_lag_accept = behind - LIVE_AUDIO_DROP_THRESHOLD + 0.02;
+        if (!is->audio_lag_warned) {
+            is->audio_lag_warned = 1;
+            av_log(NULL, AV_LOG_WARNING, "live: audio arrives ~%.0fms later than video (bundled audio packets?); "
+                   "playing audio that much behind the picture instead of dropping it\n", behind * 1000);
+        }
+        return 0;
+    }
+    return 1;   // 落后超过 0.5 秒：是积压（卡顿后涌入）而不是稳定滞后，丢掉追上
 }
 
 /**

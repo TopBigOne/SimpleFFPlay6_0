@@ -96,6 +96,8 @@ int synchronize_audio(VideoState *is, int nb_samples)
         int min_nb_samples, max_nb_samples;
 
         diff = get_clock(&is->audclk) - get_master_clock(is);
+        // 低延迟模式：音频稳定晚到时以"晚 audio_lag_accept 秒"为同步目标，否则采样补偿会把音频拉到断粮
+        diff += is->audio_lag_accept;
 
         if (!isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD) {
             is->audio_diff_cum = diff + is->audio_diff_avg_coef * is->audio_diff_cum;

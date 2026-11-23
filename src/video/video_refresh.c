@@ -115,6 +115,9 @@ retry:
 
 show:
             is->wd_last_shown = av_gettime_relative();   // 看门狗：画面还在更新
+            is->wd_pkts_since_shown = 0;
+            live_metrics_on_frame_shown(&is->metrics,
+                low_latency ? live_latency_lag(&is->live, vp->pts, is->wd_last_shown / 1000000.0) : NAN);
             SDL_LockMutex(is->pictq.mutex);
             if (!isnan(vp->pts))
                 update_video_pts(is, vp->pts, vp->pos, vp->serial);
@@ -176,6 +179,7 @@ display:
             video_display(is);
     }
     is->force_refresh = 0;
+    live_metrics_tick(is);
     if (show_status) {
         AVBPrint buf;
         static int64_t last_time;
@@ -218,9 +222,10 @@ display:
             // 低延迟模式：lag = 当前画面比"最顺利情况"晚多少，tgt = 目标延迟，jump = 跳关键帧次数
             if (low_latency && is->video_st && is->vidclk.serial == is->videoq.serial) {
                 double lag = live_latency_lag(&is->live, is->vidclk.pts, cur_time / 1000000.0);
-                av_bprintf(&buf, "lag=%4.0fms tgt=%3.0fms jump=%d frz=%d wd=%d   \r",
+                // au = 断音次数，aw = 等播放时刻次数，ad = 落后被丢的音频帧数
+                av_bprintf(&buf, "lag=%4.0fms tgt=%3.0fms jump=%d frz=%d wd=%d au=%d aw=%d ad=%d   \r",
                            isnan(lag) ? 0 : lag * 1000, live_latency_target(&is->live) * 1000, is->live.flushes,
-                           is->vid_freezes, is->wd_triggers);
+                           is->vid_freezes, is->wd_triggers, is->audio_underruns, is->audio_waits, is->audio_drops);
             }
 
             if (show_status == 1 && AV_LOG_INFO > av_log_get_level())

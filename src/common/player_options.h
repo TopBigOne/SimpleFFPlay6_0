@@ -47,6 +47,8 @@ extern int latency_max_ms;                     ///< -latency_max 低延迟模式
 extern int live_reconnect;                     ///< -live_reconnect 直播断线自动重连：1 = 开，0 = 关，-1 = 跟随 -lowlatency
 extern int reconnect_max;                      ///< -reconnect_max 连续多少次没有进展才放弃（默认 6，同 ExoPlayer）；0 = 无限重试
 extern int freeze_on_corrupt;                  ///< -freeze_on_corrupt 视频损坏时冻结等关键帧：1 = 开，0 = 关，-1 = 跟随 -lowlatency
+extern const char *metrics_file;              ///< -metrics_file 运行指标 JSON 行输出文件（NULL = 不输出）
+extern int metrics_interval;                  ///< -metrics_interval 运行指标输出间隔（秒）
 extern int audio_smooth;                       ///< -audio_smooth 断音 / 跳变处淡入淡出消除爆音：1 = 开，0 = 关，-1 = 跟随 -lowlatency
 extern int decoder_reorder_pts;                ///< -drp
 extern int autoexit;                           ///< -autoexit 播完退出

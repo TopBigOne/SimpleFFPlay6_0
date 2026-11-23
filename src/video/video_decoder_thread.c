@@ -96,6 +96,8 @@ static int frame_integrity_ok(VideoState *is, AVFrame *frame)
             av_log(NULL, AV_LOG_WARNING, "live: no keyframe within %ds, resuming display anyway\n",
                    CORRUPT_FREEZE_MAX_US / 1000000);
         if (is->vid_wait_bad)
+            is->metrics.frozen_us += now - is->vid_wait_since;
+        if (is->vid_wait_bad)
             av_log(NULL, AV_LOG_WARNING, "live: recovered after %.0fms frozen, dropped %d frames\n",
                    (now - is->vid_wait_since) / 1000.0, is->vid_wait_dropped);
         is->vid_wait_key     = 0;

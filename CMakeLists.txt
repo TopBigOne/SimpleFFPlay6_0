@@ -114,6 +114,8 @@ set(SOURCE_FILES
         src/live/live_latency.c
         src/live/audio_smooth.h
         src/live/audio_smooth.c
+        src/live/live_metrics.h
+        src/live/live_metrics.c
 
         # 界面：SDL 句柄、事件循环
         src/ui/sdl_context.h
